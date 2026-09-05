@@ -156,8 +156,6 @@ subjects = json.load(sys.stdin).get("config", {}).get("subjects", [])
 sys.exit(0 if any(matches(s) for s in subjects) else 1)' "$2"
 }
 
-# The durable consumer's state as four numbers:
-#   <undelivered> <delivered-unacked> <last-delivered-seq> <ack-floor-seq>
 consumer_state() {
   local info
   command -v python3 >/dev/null 2>&1 \
@@ -169,7 +167,8 @@ d = json.load(sys.stdin)
 print(int(d.get("num_pending", 0)),
       int(d.get("num_ack_pending", 0)),
       int(d.get("delivered", {}).get("stream_seq", 0)),
-      int(d.get("ack_floor", {}).get("stream_seq", 0)))' \
+      int(d.get("ack_floor", {}).get("stream_seq", 0)),
+      int(d.get("delivered", {}).get("consumer_seq", 0)))' \
     || fail "nats consumer info did not describe consumer $STREAM on stream $STREAM"
 }
 
@@ -207,20 +206,21 @@ cmd_next() {
 }
 
 cmd_ack() {
-  local state delivered floor
+  local state delivered floor consumer_seq ack_subject
   [ -n "$STREAM_SEQ" ] || die "ack requires --stream-seq (the sequence next reported)"
   case "$STREAM_SEQ" in
     *[!0-9]*) die "--stream-seq must be a number" ;;
   esac
   state=$(consumer_state)
-  read -r _ _ delivered floor <<<"$state"
+  read -r _ _ delivered floor consumer_seq <<<"$state"
   if [ "$STREAM_SEQ" -le "$floor" ]; then
     printf 'ack: stream=%s stream-seq=%s already handled\n' "$STREAM" "$STREAM_SEQ"
     return 0
   fi
   [ "$STREAM_SEQ" -eq "$delivered" ] \
     || fail "stream-seq $STREAM_SEQ is not the steer consumer $STREAM last delivered ($delivered); run next first"
-  fm_carverauto_nats_run consumer next "$STREAM" "$STREAM" --count 1 --ack --raw >&2 \
+  ack_subject="\$JS.ACK.$STREAM.$STREAM.1.$STREAM_SEQ.$consumer_seq.0.0"
+  fm_carverauto_nats_run request "$ack_subject" +ACK --raw >&2 \
     || fail "nats could not acknowledge stream-seq $STREAM_SEQ on stream $STREAM"
   printf 'ack: stream=%s stream-seq=%s handled\n' "$STREAM" "$STREAM_SEQ"
 }
@@ -262,7 +262,7 @@ print("subject=%s task=%s seq=%s"
 cmd_list() {
   local state pending ackpending floor total last seq shown unreadable line
   state=$(consumer_state)
-  read -r pending ackpending _ floor <<<"$state"
+  read -r pending ackpending _ floor _ <<<"$state"
   total=$((pending + ackpending))
   printf 'stream=%s pending=%s\n' "$STREAM" "$total"
   [ "$total" -gt 0 ] || return 0

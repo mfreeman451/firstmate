@@ -138,6 +138,17 @@ case "${args[0]:-}" in
     printf '%s' "$body" >"$store/msgs/$(printf '%04d' "$n").body"
     printf 'Stored in Stream: %s Sequence: %s\n' "$captured" "$n" >&2
     exit 0 ;;
+  request)
+    IFS=. read -r prefix kind stream consumer count seq delivery timestamp pending <<<"${args[1]:-}"
+    [ "$prefix.$kind" = '$JS.ACK' ] && [ "${args[2]:-}" = +ACK ] || exit 2
+    [ "$seq" -le "$(state_get delivered)" ] || exit 1
+    if [ "$seq" -gt "$(state_get floor)" ]; then
+      printf '%s' "$seq" >"$store/floor"
+    fi
+    if [ "$(state_get nak)" = "$seq" ]; then
+      printf '0' >"$store/nak"
+    fi
+    exit 0 ;;
   stream)
     i=4
     while [ "$i" -lt "${#args[@]}" ]; do
@@ -221,6 +232,24 @@ case "${args[0]:-}" in
           esac
           i=$((i + 1))
         done
+        if [ -n "${NATS_FAKE_ACK_SLOT:-}" ]; then
+          snapshot=$(NATS_FAKE_ACK_SLOT= "$0" consumer info "${args[2]}" "${args[3]}" --json)
+          touch "$store/ready.$NATS_FAKE_ACK_SLOT"
+          for ((attempt=0; attempt<500; attempt++)); do
+            [ -f "$store/ready.1" ] && [ -f "$store/ready.2" ] && break
+            /bin/sleep 0.01
+          done
+          [ -f "$store/ready.1" ] && [ -f "$store/ready.2" ] || exit 1
+          if [ "$NATS_FAKE_ACK_SLOT" = 2 ]; then
+            for ((attempt=0; attempt<500; attempt++)); do
+              [ "$(state_get floor)" -ge 1 ] && break
+              /bin/sleep 0.01
+            done
+            [ "$(state_get floor)" -ge 1 ] || exit 1
+          fi
+          printf '%s\n' "$snapshot"
+          exit 0
+        fi
         ackpending=0
         [ "$(state_get nak)" = 0 ] || ackpending=1
         printf '{"stream_name":"%s","name":"%s","delivered":{"consumer_seq":%s,"stream_seq":%s},' \
@@ -553,6 +582,25 @@ test_repeated_ack_never_handles_an_unread_steer() {
   [ "$second" = "second steer" ] \
     || fail "the unread steer should still be deliverable, got: $second"
   pass "fm-steer: a repeated ack never handles a steer nobody read"
+}
+
+test_overlapping_ack_retries_preserve_unread_steer() {
+  local dir seq first second body
+  dir=$(setup_overlay_dir ack-overlap)
+  steer "$dir" put --stream firstmate --task t1 --seq 1 --body "first steer" >/dev/null
+  steer "$dir" put --stream firstmate --task t2 --seq 1 --body "unread steer" >/dev/null
+  seq=$(steer "$dir" next --stream firstmate | reported_stream_seq)
+  NATS_FAKE_ACK_SLOT=1 steer "$dir" ack --stream firstmate --stream-seq "$seq" >"$dir/first" &
+  first=$!
+  NATS_FAKE_ACK_SLOT=2 steer "$dir" ack --stream firstmate --stream-seq "$seq" >"$dir/second" &
+  second=$!
+  wait "$first" || fail "first overlapping ack failed"
+  wait "$second" || fail "second overlapping ack failed"
+  [ "$(pending_count "$dir" firstmate)" = 1 ] \
+    || fail "overlapping acknowledgements consumed an unread steer"
+  body=$(steer "$dir" next --stream firstmate | after_separator | after_separator)
+  [ "$body" = "unread steer" ] || fail "unread steer was not preserved: $body"
+  pass "fm-steer: overlapping ack retries preserve the unread steer"
 }
 
 test_ack_refuses_another_sequence() {
@@ -910,6 +958,7 @@ test_put_requires_the_contract_fields
 test_steer_has_no_contract_escape_hatches
 test_next_peeks_and_ack_handles_that_steer
 test_repeated_ack_never_handles_an_unread_steer
+test_overlapping_ack_retries_preserve_unread_steer
 test_ack_refuses_another_sequence
 test_list_enumerates_the_pending_steers
 test_list_bounds_the_steers_it_describes
