@@ -14,7 +14,8 @@
 # bin/fm-steer.sh, whose subject and schema are pinned to the steering-inbox
 # contract. Nothing on this path touches the on-disk steering inbox.
 #
-# The payload is published byte for byte, which needs natscli 0.4.0 or newer.
+# The payload is published to JetStream byte for byte, so a subject no stream
+# captures fails the assign; that needs natscli 0.4.0 or newer.
 #
 # Default portal_url: https://firstmate.carverauto.dev
 # bin/fm-carverauto-lib.sh owns overlay opt-in, URL resolution, and the nats

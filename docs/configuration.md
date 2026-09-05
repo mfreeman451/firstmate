@@ -497,7 +497,7 @@ This overlay is not inherited by secondmate homes.
 Gitignored leaves, each overridable by the matching environment variable:
 
 - `config/carverauto-notify-py` / `FM_CARVERAUTO_NOTIFY_PY` - path to firstmate-notify's `notify.py` (default `~/src/firstmate-notify/notify.py`)
-- `config/carverauto-nats-url` / `FM_CARVERAUTO_NATS_URL` or `NATS_URL` - NATS server URL for the `nats` CLI; absent leaves the server to the `nats` CLI's own context. It must not embed credentials: a URL with userinfo (`nats://user:pass@host`) is refused, because the URL rides `nats --server` on argv
+- `config/carverauto-nats-url` / `FM_CARVERAUTO_NATS_URL` - NATS server URL for the `nats` CLI; absent leaves the server to that CLI's own context or `NATS_URL`, which the overlay never copies onto argv. What is set here must not embed credentials: a URL with userinfo (`nats://user:pass@host`) is refused, because this value rides `nats --server` on argv
 - `config/carverauto-inbox-stream` / `FM_CARVERAUTO_INBOX_STREAM` - JetStream stream `fm-send` dual-writes to
 - `config/carverauto-portal-url` / `FM_CARVERAUTO_PORTAL_URL` - fleet portal, default `https://firstmate.carverauto.dev`
 
@@ -507,6 +507,8 @@ Never commit those values.
 
 `bin/fm-steer.sh` is the OpenSpec CLI (`put`/`next`/`ack`/`list`, required `--stream`, subject `firstmate.steer.<task>`, payload `fm-task-inbox.v1`).
 JetStream is its only store: it needs natscli 0.4.0 or newer, whose `--templates=false` keeps a steer body byte for byte (older ones expand `{{...}}` in it and are refused), and a steer stays pending until `ack --stream-seq` acknowledges the exact steer `next` reported.
+`put` publishes to JetStream and fails when no stream stored the steer, so the stream capturing `firstmate.steer.>` must exist first.
+`next`, `ack`, and `list` address a durable pull consumer named after the stream, with `AckPolicy=explicit`; create it with `nats consumer add` before using them, because the overlay never provisions it.
 A portal assignment is a separate family on `firstmate.assign.<task>` with its own publisher.
 `bin/fm-steer.sh` never deletes a task's on-disk inbox under `state/<id>.inbox/`.
 Dual-write is additive only, and a dual-write that cannot reach NATS is a notice, never a failed steer.

@@ -145,8 +145,7 @@ The shared no-mistakes gate refusal for fleet lifecycle entrypoints is summarize
 | `fm-public-followup-collect.sh` | Read and retire the typed terminal results a remote work home staged for the home that owes the public reply |
 | `fm-inbox.sh`            | The captain's out-of-band capture surface: queue a note, dictate one, read status, ask a side question |
 | `fm-carverauto-notify.sh` | Page Discord for captain-attention messages on this Carverauto fork, including the fleet portal URL |
-| `fm-steer.sh`            | OpenSpec steering-inbox CLI (`put`/`next`/`ack`/`list`, `--stream` required, subject `firstmate.steer.<task>`) |
-| `fm-carverauto-inbox.sh` | This fork's fm-steer implementation; same contract, never deletes the on-disk inbox |
+| `fm-steer.sh`            | OpenSpec steering-inbox CLI (`put`/`next`/`ack`/`list`, `--stream` required, subject `firstmate.steer.<task>`); never deletes the on-disk inbox |
 | `fm-carverauto-portal.sh` | Publish a task assignment onto JetStream for firstmate.carverauto.dev |
 | `fm-carverauto-lib.sh`   | Shared Carverauto overlay opt-in, portal URL, and additive dual-write helper |
 | `fm-voice-relay.py`      | Hold the spoken conversation on this host, answer from the records, and hand real work to `fm-inbox.sh` ([voice-relay.md](voice-relay.md)) |

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # fm-carverauto-lib.sh - shared helpers for this fork's Carverauto overlay.
 #
-# Sourced by bin/fm-carverauto-notify.sh, bin/fm-carverauto-inbox.sh,
+# Sourced by bin/fm-carverauto-notify.sh, bin/fm-steer.sh,
 # bin/fm-carverauto-portal.sh, and bin/fm-send.sh. No side effects on source.
 # Discord tokens, NATS credentials, and GITHUB_TOKEN never belong in git or in
 # this library's output; they stay in the operator's environment or gitignored
@@ -20,7 +20,7 @@ FM_CARVERAUTO_PORTAL_DEFAULT='https://firstmate.carverauto.dev'
 FM_CARVERAUTO_NOTIFY_PY_DEFAULT="$HOME/src/firstmate-notify/notify.py"
 # The portal assignment is its own message family, never the steer contract:
 # subject firstmate.assign.<task>, schema below. bin/fm-carverauto-portal.sh
-# is its only publisher; bin/fm-carverauto-inbox.sh publishes steers only.
+# is its only publisher; bin/fm-steer.sh publishes steers only.
 # shellcheck disable=SC2034 # Read by the sourcing publisher.
 FM_CARVERAUTO_PORTAL_SCHEMA='fm-carverauto-portal-assign.v1'
 
@@ -87,13 +87,12 @@ fm_carverauto_portal_url() {
   printf '%s' "$FM_CARVERAUTO_PORTAL_DEFAULT"
 }
 
+# The overlay's own server override only. NATS_URL is natscli's own environment
+# variable and already outranks its selected context, so this never copies it:
+# leaving it in the environment keeps a URL that carries userinfo off argv.
 fm_carverauto_nats_url() {
   if [ -n "${FM_CARVERAUTO_NATS_URL:-}" ]; then
     printf '%s' "$FM_CARVERAUTO_NATS_URL"
-    return 0
-  fi
-  if [ -n "${NATS_URL:-}" ]; then
-    printf '%s' "$NATS_URL"
     return 0
   fi
   fm_carverauto_config_read carverauto-nats-url
@@ -131,22 +130,25 @@ fm_carverauto_nats_run() {  # <nats-args...>
   fi
 }
 
-# ONE owner of publishing a payload. natscli expands Go templates ({{Count}},
-# {{ID}}, {{Time}}, ...) in a publish body unless --templates=false is passed,
-# and that flag exists only from natscli 0.4.0. A CLI without it cannot carry a
-# body byte for byte, so the overlay refuses up front instead of publishing a
-# message that differs from what the caller handed it.
+# ONE owner of publishing a payload, and it always publishes to JetStream (-J):
+# a core publish is dropped without error when no subscriber is listening, so
+# only the JetStream acknowledgement proves a stream stored the message.
+# natscli also expands Go templates ({{Count}}, {{ID}}, {{Time}}, ...) in a
+# publish body unless --templates=false is passed, and that flag exists only
+# from natscli 0.4.0. A CLI without it cannot carry a body byte for byte, so the
+# overlay refuses up front instead of publishing something other than what the
+# caller handed it.
 fm_carverauto_nats_publish() {  # <subject> <payload>
   local help
   help=$(fm_carverauto_nats_run publish --help) || return 1
   case "$help" in
-    *'--[no-]templates'*|*--templates*) ;;
+    *'--[no-]templates'*) ;;
     *)
       echo "error: this nats CLI expands Go templates in a published body and cannot be told not to; the Carverauto overlay needs natscli 0.4.0 or newer, which accepts --templates=false" >&2
       return 1
       ;;
   esac
-  fm_carverauto_nats_run publish --templates=false "$1" -- "$2"
+  fm_carverauto_nats_run publish -J --templates=false "$1" -- "$2"
 }
 
 fm_carverauto_now() {

@@ -15,7 +15,7 @@ metadata:
 
 This is this fork's operator overlay for Carverauto.
 It is not upstream firstmate.
-`bin/fm-carverauto-notify.sh`, `bin/fm-carverauto-inbox.sh`, and `bin/fm-carverauto-portal.sh` own exact flags.
+`bin/fm-carverauto-notify.sh`, `bin/fm-steer.sh`, and `bin/fm-carverauto-portal.sh` own exact flags.
 [`docs/configuration.md`](../../../docs/configuration.md#carverauto-overlay) owns opt-in files and environment.
 
 Do not put a Discord webhook, bot token, NATS password, or `GITHUB_TOKEN` in git, in this skill, or in chat.
@@ -66,6 +66,8 @@ Do not delete those files.
 This CLI has no path that removes a task inbox.
 
 JetStream is the only store: the `nats` CLI must be on PATH and be natscli 0.4.0 or newer (older ones expand `{{...}}` in a steer body and are refused).
+`put` publishes to JetStream, so it fails rather than reporting a delivery when no stream captured the subject.
+`next`, `ack`, and `list` need a durable pull consumer named after the stream (`AckPolicy=explicit`) to exist already; the overlay never creates one.
 NATS credentials stay in that CLI's environment (`NATS_USER`, `NATS_PASSWORD`, `NATS_CREDS`); a server URL that embeds them is refused, because the URL rides argv.
 A dual-write that cannot reach NATS prints a notice; the on-disk record is still the delivered steer.
 

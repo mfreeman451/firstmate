@@ -3,10 +3,12 @@
 #
 # Drives the public notify, steer, and portal executables plus fm-send's
 # additive dual-write. JetStream is the steer inbox's only store, so a fake
-# nats broker stands in for the server: it stores published messages, models
+# nats broker stands in for the server: it stores a message only when it is
+# published to JetStream on a subject a stream captures - a core publish is
+# dropped exactly as a real server drops one with no subscriber - and it models
 # the one durable consumer (delivery, negative acknowledgement, ack floor) and
-# models natscli's Go-template expansion of a publish body, which is what the
-# CLI must switch off. Discord tokens never appear on argv or in wrapper output.
+# natscli's Go-template expansion of a publish body, which is what the CLI must
+# switch off. Discord tokens never appear on argv or in wrapper output.
 # shellcheck disable=SC2016
 set -u
 
@@ -41,10 +43,14 @@ PY
 # A fake NATS server for the subset of the CLI the overlay uses. It rejects any
 # flag the modelled binary does not implement, exactly as fisk does, so a test
 # can never pass against a CLI shape the real binary lacks.
-#   publish        stores subject+body under $NATS_STORE/msgs, and - like
-#                  natscli - expands {{Count}} in the body unless the publisher
-#                  passed --templates=false; NATS_FAKE_TEMPLATES=0 models a
-#                  natscli older than 0.4.0, which has no such flag at all
+#   publish        stores subject+body under $NATS_STORE/msgs only for a -J
+#                  publish whose subject matches a prefix in $NATS_STORE/subjects
+#                  (the stream's subject set); a core publish is accepted and
+#                  dropped, and a -J publish no stream captures fails as the
+#                  JetStream acknowledgement would. Like natscli it expands
+#                  {{Count}} in the body unless the publisher passed
+#                  --templates=false; NATS_FAKE_TEMPLATES=0 models a natscli
+#                  older than 0.4.0, which has no such flag at all
 #   consumer next  serves the head of the one durable consumer: --nak leaves it
 #                  pending and first in line, --ack advances the ack floor
 #   consumer info  reports that consumer's delivered/ack_floor sequences and
@@ -80,6 +86,7 @@ state_get() { cat "$store/$1" 2>/dev/null || printf '0'; }
 case "${args[0]:-}" in
   publish)
     expand=1
+    js=0
     rest=()
     i=1
     while [ "$i" -lt "${#args[@]}" ]; do
@@ -91,10 +98,12 @@ case "${args[0]:-}" in
           printf '  -H, --header=HEADER ...  Adds headers to the message\n'
           printf '      --count=1            Publish multiple messages\n'
           printf '      --force-stdin        Force reading from stdin\n'
+          printf '  -J, --jetstream          Publish messages to jetstream\n'
           if [ "$templates" = 1 ]; then
             printf '      --[no-]templates     Enables template functions in the body and subject\n'
           fi
           exit 0 ;;
+        -J|--jetstream) js=1 ;;
         --templates=false)
           [ "$templates" = 1 ] || reject --templates
           expand=0 ;;
@@ -104,13 +113,29 @@ case "${args[0]:-}" in
       esac
       i=$((i + 1))
     done
+    subject=${rest[0]}
     body=${rest[1]:-}
     if [ "$expand" = 1 ]; then
       body=${body//\{\{Count\}\}/1}
     fi
+    if [ "$js" = 0 ]; then
+      exit 0
+    fi
+    captured=0
+    if [ -f "$store/subjects" ]; then
+      while IFS= read -r prefix; do
+        [ -n "$prefix" ] || continue
+        case "$subject" in "$prefix"*) captured=1 ;; esac
+      done <"$store/subjects"
+    fi
+    if [ "$captured" = 0 ]; then
+      printf 'nats: error: nats: no responders available for request\n' >&2
+      exit 1
+    fi
     n=$(( $(stored) + 1 ))
-    printf '%s' "${rest[0]}" >"$store/msgs/$(printf '%04d' "$n").subject"
+    printf '%s' "$subject" >"$store/msgs/$(printf '%04d' "$n").subject"
     printf '%s' "$body" >"$store/msgs/$(printf '%04d' "$n").body"
+    printf 'Stored in Stream: fake Sequence: %s\n' "$n" >&2
     exit 0 ;;
   consumer)
     case "${args[1]:-}" in
@@ -260,10 +285,13 @@ pending_count() {  # <dir> <stream>
   steer "$1" list --stream "$2" | awk -F'pending=' 'NF > 1 { print $2; exit }'
 }
 
+# The subject set of the stream the fake broker stands up: a JetStream publish
+# outside it is not stored, exactly as a real server refuses one no stream owns.
 setup_overlay_dir() {  # <name> -> echoes a dir with fakebin, home, and store
   local dir="$TMP_ROOT/$1"
   mkdir -p "$dir/home/state" "$dir/home/config" "$dir/nats/msgs"
   make_nats_stub "$dir"
+  printf 'firstmate.steer.\nfirstmate.assign.\n' >"$dir/nats/subjects"
   printf '%s\n' "$dir"
 }
 
@@ -346,6 +374,37 @@ test_nats_url_must_not_carry_credentials() {
   log=$(cat "$dir/nats/argv.log" 2>/dev/null || printf '')
   assert_not_contains "$log" "s3cret" "the password must never reach the nats CLI argv"
   pass "fm-steer: a NATS URL that embeds credentials never reaches argv"
+}
+
+test_put_fails_when_no_stream_stored_the_steer() {
+  local dir err rc
+  dir=$(setup_overlay_dir no-stream)
+  err="$dir/err"
+  printf 'firstmate.assign.\n' >"$dir/nats/subjects"
+  set +e
+  steer "$dir" put --stream firstmate --task t1 --seq 1 --body "please rebase" \
+    >/dev/null 2>"$err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "a steer no stream stored must not report a delivery"
+  assert_contains "$(cat "$err")" "firstmate.steer.t1" "the failure should name the subject"
+  [ "$(published_count "$dir")" = 0 ] || fail "nothing should have been stored"
+  pass "fm-steer: put fails when no stream captured the steer subject"
+}
+
+test_nats_url_env_is_left_to_the_nats_cli() {
+  local dir out log
+  dir=$(setup_overlay_dir nats-env-url)
+  out=$(env PATH="$dir/fakebin:$PATH" FM_HOME="$dir/home" NATS_STORE="$dir/nats" \
+    NATS_URL='nats://fm:s3cret@nats.carverauto.dev:4222' \
+    "$STEER" put --stream firstmate --task t1 --seq 1 --body "please rebase") \
+    || fail "natscli's own NATS_URL must not block a steer"
+  assert_contains "$out" "subject=firstmate.steer.t1" "the steer should publish normally"
+  [ "$(published_count "$dir")" = 1 ] || fail "the steer should have been stored"
+  log=$(cat "$dir/nats/argv.log")
+  assert_not_contains "$log" "s3cret" "NATS_URL must never be copied onto the nats CLI argv"
+  assert_not_contains "$log" "server=" "the overlay passes no --server when it has no URL of its own"
+  pass "fm-steer: NATS_URL stays in the nats CLI's own environment"
 }
 
 test_put_marks_fire_and_forget() {
@@ -626,6 +685,26 @@ test_send_dual_write_keeps_disk_inbox() {
   pass "fm-send: overlay dual-write is additive and keeps the on-disk inbox"
 }
 
+test_send_dual_write_reports_a_steer_that_did_not_land() {
+  local dir rec err
+  dir=$(setup_overlay_dir send-nostream)
+  make_tmux_stubs "$dir"
+  fm_write_meta "$dir/home/state/t1.meta" "window=sess:fm-t1" "kind=ship" "harness=claude"
+  printf 'on\n' >"$dir/home/config/carverauto-overlay"
+  printf 'firstmate\n' >"$dir/home/config/carverauto-inbox-stream"
+  printf 'firstmate.assign.\n' >"$dir/nats/subjects"
+  : >"$dir/send.log"
+  err="$dir/err"
+  run_send "$dir" t1 "please rebase onto main" >/dev/null 2>"$err" \
+    || fail "a dual-write that did not land must not fail the steer"
+  rec="$dir/home/state/t1.inbox/001.msg"
+  [ -f "$rec" ] || fail "the on-disk record is still the delivery record"
+  [ "$(published_count "$dir")" = 0 ] || fail "nothing should have been stored"
+  assert_contains "$(cat "$err")" "dual-write did not land" \
+    "fm-send should say the JetStream copy did not land"
+  pass "fm-send: a steer no stream stored is reported, never counted as landed"
+}
+
 test_send_idempotent_resend_publishes_once() {
   local dir delivery
   dir=$(setup_overlay_dir send-idempotent)
@@ -661,8 +740,10 @@ test_send_without_overlay_skips_dual_write() {
 test_stream_required
 test_put_publishes_the_full_envelope
 test_put_sends_the_body_bytes_unchanged
+test_put_fails_when_no_stream_stored_the_steer
 test_put_refuses_a_nats_cli_that_rewrites_bodies
 test_nats_url_must_not_carry_credentials
+test_nats_url_env_is_left_to_the_nats_cli
 test_put_marks_fire_and_forget
 test_put_requires_the_contract_fields
 test_steer_has_no_contract_escape_hatches
@@ -677,5 +758,6 @@ test_notify_archify_requires_a_diagram
 test_portal_assign_publishes_its_own_family
 test_portal_rejects_non_https
 test_send_dual_write_keeps_disk_inbox
+test_send_dual_write_reports_a_steer_that_did_not_land
 test_send_idempotent_resend_publishes_once
 test_send_without_overlay_skips_dual_write
