@@ -705,7 +705,16 @@ test_notify_archify_requires_a_diagram() {
     "$NOTIFY" archify --title "Fleet map" --png "$home/map.png")
   assert_contains "$out" "sent archify" "archify with a diagram runs notify.py archify"
   assert_contains "$(cat "$log")" "--png" "the diagram should reach notify.py"
-  pass "notify: archify pages as archify or refuses, never as captain-needed"
+  : >"$log"
+  set +e
+  FM_CARVERAUTO_NOTIFY_PY="$home/notify.py" NOTIFY_LOG="$log" \
+    "$NOTIFY" archify --title "Fleet map" --html "$home/map.html" >/dev/null 2>"$err"
+  rc=$?
+  set -e
+  expect_code 2 "$rc" "Discord renders no HTML, so archify takes no HTML attachment"
+  assert_contains "$(cat "$err")" "unknown option: --html" "the refusal should name the rejected flag"
+  [ ! -s "$log" ] || fail "a refused archify must not page Discord: $(cat "$log")"
+  pass "notify: archify pages a PNG diagram or refuses, never HTML and never as captain-needed"
 }
 
 test_portal_assign_publishes_its_own_family() {

@@ -4,7 +4,7 @@
 # Usage:
 #   fm-carverauto-notify.sh captain-needed --title <text> [--body <text>] [--file <path>]...
 #   fm-carverauto-notify.sh pr-landed --url <https-url> --outcome <text>
-#   fm-carverauto-notify.sh archify --title <text> (--png <path> | --html <path>) [--notes <text>]
+#   fm-carverauto-notify.sh archify --title <text> --png <path> [--notes <text>]
 #
 # Wraps python3 notify.py from firstmate-notify. The Discord webhook token is
 # never read, printed, or stored by this script: notify.py loads
@@ -41,7 +41,6 @@ TITLE=
 BODY=
 URL=
 OUTCOME=
-HTML=
 PNG=
 NOTES=
 FILES=()
@@ -77,11 +76,6 @@ while [ "$#" -gt 0 ]; do
     --outcome)
       [ -n "${2-}" ] || die "--outcome needs a value"
       OUTCOME=$2
-      shift 2
-      ;;
-    --html)
-      [ -n "${2-}" ] || die "--html needs a path"
-      HTML=$2
       shift 2
       ;;
     --png)
@@ -137,20 +131,12 @@ case "$CMD" in
     ;;
   archify)
     [ -n "$TITLE" ] || die "archify requires --title"
-    # A diagram page carries the diagram. A text-only page is captain-needed,
-    # under that name, so the caller always knows which page Discord gets.
-    [ -n "$HTML" ] || [ -n "$PNG" ] \
-      || die "archify requires --png or --html (use captain-needed for a text page)"
+    # A diagram page carries the diagram, and Discord renders a PNG - it does
+    # not render HTML, and the portal URL is the live diagram. A text-only page
+    # is captain-needed, under that name, so the caller always knows which page
+    # Discord gets.
+    [ -n "$PNG" ] || die "archify requires --png (use captain-needed for a text page)"
     NOTES=$(append_portal "$NOTES")
-    args=(archify --title "$TITLE" --notes "$NOTES")
-    # Discord does not render HTML; the portal URL is the live diagram.
-    # Pass --html only when the caller explicitly asked for the file.
-    if [ -n "$HTML" ]; then
-      args+=(--html "$HTML")
-    fi
-    if [ -n "$PNG" ]; then
-      args+=(--png "$PNG")
-    fi
-    run_notify "${args[@]}"
+    run_notify archify --title "$TITLE" --notes "$NOTES" --png "$PNG"
     ;;
 esac

@@ -33,7 +33,7 @@ bin/fm-carverauto-notify.sh captain-needed --title "<headline>" --body "<captain
 Use that for decisions, blockers, credentials, no-mistakes gates that need the captain, landed PRs, Archify, and low-disk alerts.
 The wrapper appends the fleet portal URL (`https://firstmate.carverauto.dev` by default) so Discord gets a live link rather than an HTML attachment.
 Landed PRs use `pr-landed --url <https-url> --outcome "<one line>"`.
-Archify uses `archify --title "<title>" --png <path>`; it requires a `--png` or `--html` diagram, and a text-only page is `captain-needed`.
+Archify uses `archify --title "<title>" --png <path>`; the `--png` diagram is required, and a text-only page is `captain-needed`.
 
 `notify.py` stays in firstmate-notify.
 This wrapper never reads or prints the webhook.
