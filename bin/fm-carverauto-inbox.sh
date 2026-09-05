@@ -2,34 +2,36 @@
 # This fork's fm-steer CLI: JetStream steering inbox for Carverauto.
 #
 # Usage:
-#   fm-carverauto-inbox.sh put  --stream <name> [--task <id>] [--body <text>] [--subject <subject>] [--seq <n>] [--delivery fire-and-forget]
+#   fm-carverauto-inbox.sh put  --stream <name> --task <id> --seq <n> [--body <text>] [--delivery fire-and-forget]
 #   fm-carverauto-inbox.sh next --stream <name> [--consumer <name>]
-#   fm-carverauto-inbox.sh ack  --stream <name> --ack <ack-id>
-#   fm-carverauto-inbox.sh list --stream <name>
+#   fm-carverauto-inbox.sh ack  --stream <name> [--consumer <name>]
+#   fm-carverauto-inbox.sh list --stream <name> [--consumer <name>]
 #
-# --stream is required on every command. Body for put is --body or stdin.
+# --stream is required on every command; the durable consumer defaults to the
+# stream name. Body for put is --body or stdin.
 # bin/fm-steer.sh is the same CLI under the OpenSpec command name.
 #
 # Contract (OpenSpec add-firstmate-portal in firstmate-notify):
 #   put/next/ack/list, required --stream, subject firstmate.steer.<task>,
 #   ack = handled, list = pending, payload schema=fm-task-inbox.v1 with
 #   at, task, seq, body, and optional fire-and-forget.
+# The subject and the schema are pinned: this CLI publishes that family and
+# nothing else. A portal assignment is a different family with its own
+# publisher (bin/fm-carverauto-portal.sh), not an override here.
+#
+# JetStream is the only store. put publishes the envelope; next peeks the head
+# of the durable consumer and negative-acknowledges it, so the message stays
+# pending until ack acknowledges it; list reports the consumer's unacked
+# count. The overlay keeps no message store of its own.
 #
 # This is the contract fm-send dual-writes to. It never deletes, moves, or
-# truncates a task's on-disk steering inbox (state/<id>.inbox/). Keep that
-# disk inbox until dual-write is the only path; this CLI has no path that
-# removes it.
+# truncates a task's on-disk steering inbox (state/<id>.inbox/), which remains
+# the delivery record; this CLI has no path that removes it.
 #
-# Backends:
-#   file  default when no NATS URL is configured. Store under
-#         state/carverauto-inbox/<stream>/ (override with FM_CARVERAUTO_INBOX_DIR).
-#   nats  when FM_CARVERAUTO_INBOX_BACKEND=nats or a NATS URL is configured.
-#         Uses the nats CLI. Credentials stay in NATS_URL / NATS_USER /
-#         NATS_PASSWORD / NATS_CREDS, never in git.
-#
-# bin/fm-carverauto-lib.sh owns overlay opt-in. The carverauto-overlay skill
-# owns when firstmate should dual-write. Do not silently skip the on-disk
-# inbox from fm-send: dual-write is additive only.
+# bin/fm-carverauto-lib.sh owns overlay opt-in and the nats invocation, so
+# credentials stay in the nats CLI environment and never reach argv. The
+# carverauto-overlay skill owns when firstmate should dual-write. Do not
+# silently skip the on-disk inbox from fm-send: dual-write is additive only.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -48,13 +50,10 @@ usage() {
   exit 2
 }
 
+SCHEMA=fm-task-inbox.v1
 CMD=
 STREAM=
-SUBJECT=
 CONSUMER=
-ACK_ID=
-MSG_ID=
-SCHEMA=
 TASK_ID=
 SEQ_ARG=
 DELIVERY=
@@ -73,29 +72,9 @@ while [ "$#" -gt 0 ]; do
       STREAM=$2
       shift 2
       ;;
-    --subject)
-      [ -n "${2-}" ] || die "--subject needs a value"
-      SUBJECT=$2
-      shift 2
-      ;;
     --consumer)
       [ -n "${2-}" ] || die "--consumer needs a name"
       CONSUMER=$2
-      shift 2
-      ;;
-    --ack)
-      [ -n "${2-}" ] || die "--ack needs an id"
-      ACK_ID=$2
-      shift 2
-      ;;
-    --id)
-      [ -n "${2-}" ] || die "--id needs a value"
-      MSG_ID=$2
-      shift 2
-      ;;
-    --schema)
-      [ -n "${2-}" ] || die "--schema needs a value"
-      SCHEMA=$2
       shift 2
       ;;
     --task)
@@ -127,69 +106,9 @@ done
 
 [ -n "$CMD" ] || die "command required: put, next, ack, or list"
 [ -n "$STREAM" ] || die "--stream is required"
-fm_carverauto_valid_stream "$STREAM" || die "invalid --stream (use a NATS-safe token, no path separators)"
-
-BACKEND=$(fm_carverauto_inbox_backend)
-case "$BACKEND" in
-  file|nats) ;;
-  *) die "unknown inbox backend: $BACKEND (file or nats)" ;;
-esac
-
-STORE=$(fm_carverauto_inbox_dir)
-if [ -z "$SUBJECT" ]; then
-  if [ -n "$TASK_ID" ]; then
-    SUBJECT="firstmate.steer.${TASK_ID}"
-  else
-    SUBJECT=firstmate.steer
-  fi
-fi
+fm_carverauto_valid_token "$STREAM" || die "invalid --stream (use a NATS-safe token, no path separators)"
 CONSUMER=${CONSUMER:-$STREAM}
-SCHEMA=${SCHEMA:-fm-task-inbox.v1}
-
-pad_seq() {
-  printf '%04d' "$1"
-}
-
-file_stream_dir() {
-  printf '%s/%s' "$STORE" "$STREAM"
-}
-
-file_lock_acquire() {
-  local dir=$1 lock
-  mkdir -p "$dir"
-  lock="$dir/.lock"
-  local i=0
-  while ! mkdir "$lock" 2>/dev/null; do
-    i=$((i + 1))
-    [ "$i" -lt 50 ] || fail "could not lock stream $STREAM"
-    sleep 0.05
-  done
-}
-
-file_lock_release() {
-  rmdir "$1/.lock" 2>/dev/null || true
-}
-
-file_read_body() {  # <path>
-  awk '
-    BEGIN { seen=0 }
-    seen { print }
-    $0 == "--" { seen=1 }
-  ' "$1"
-}
-
-nats_bin() {
-  command -v nats >/dev/null 2>&1 || fail "nats CLI not found on PATH (install nats or use FM_CARVERAUTO_INBOX_BACKEND=file)"
-  printf '%s' nats
-}
-
-nats_args() {
-  local url
-  url=$(fm_carverauto_nats_url)
-  if [ -n "$url" ]; then
-    printf '%s\n' --server "$url"
-  fi
-}
+fm_carverauto_valid_token "$CONSUMER" || die "invalid --consumer (use a NATS-safe token, no path separators)"
 
 put_body() {
   if [ -n "$BODY_ARG" ]; then
@@ -200,187 +119,58 @@ put_body() {
   cat
 }
 
-cmd_put_file() {
-  local dir seq_file seq dest body tmp
-  body=$(put_body)
-  dir=$(file_stream_dir)
-  file_lock_acquire "$dir"
-  seq_file="$dir/seq"
-  mkdir -p "$dir/available" "$dir/pending" "$dir/handled"
-  seq=0
-  if [ -f "$seq_file" ]; then
-    seq=$(tr -d '[:space:]' <"$seq_file")
-  fi
-  case "$seq" in
-    ''|*[!0-9]*) seq=0 ;;
+cmd_put() {
+  local body payload
+  [ -n "$TASK_ID" ] || die "put requires --task (the subject is firstmate.steer.<task>)"
+  fm_carverauto_valid_token "$TASK_ID" || die "invalid --task (use a NATS-safe token, no path separators)"
+  [ -n "$SEQ_ARG" ] || die "put requires --seq (the fm-task-inbox.v1 record sequence)"
+  case "$SEQ_ARG" in
+    *[!0-9]*) die "--seq must be a number" ;;
   esac
-  seq=$((seq + 1))
-  printf '%s\n' "$seq" >"$seq_file"
-  dest="$dir/available/$(pad_seq "$seq")"
-  tmp=$(mktemp "$dir/.put.XXXXXX")
-  payload_seq=$seq
-  if [ -n "$SEQ_ARG" ]; then
-    payload_seq=$SEQ_ARG
+  body=$(put_body)
+  payload="schema=$SCHEMA"$'\n'"at=$(fm_carverauto_now)"$'\n'"task=$TASK_ID"$'\n'"seq=$SEQ_ARG"$'\n'
+  if [ "$DELIVERY" = fire-and-forget ]; then
+    payload="${payload}delivery=fire-and-forget"$'\n'
   fi
-  {
-    printf 'schema=%s\n' "$SCHEMA"
-    printf 'at=%s\n' "$(fm_carverauto_now)"
-    [ -n "$TASK_ID" ] && printf 'task=%s\n' "$TASK_ID"
-    printf 'seq=%s\n' "$payload_seq"
-    [ "$DELIVERY" = fire-and-forget ] && printf 'delivery=fire-and-forget\n'
-    [ -n "$MSG_ID" ] && printf 'id=%s\n' "$MSG_ID"
-    printf 'subject=%s\n' "$SUBJECT"
-    printf -- '--\n'
-    printf '%s' "$body"
-  } >"$tmp"
-  mv "$tmp" "$dest"
-  file_lock_release "$dir"
-  printf 'put: stream=%s seq=%s subject=%s\n' "$STREAM" "$seq" "$SUBJECT"
+  payload="${payload}--"$'\n'"$body"
+  fm_carverauto_nats_run publish "firstmate.steer.${TASK_ID}" -- "$payload" >&2 \
+    || fail "nats publish to firstmate.steer.${TASK_ID} failed"
+  printf 'put: stream=%s subject=firstmate.steer.%s seq=%s\n' "$STREAM" "$TASK_ID" "$SEQ_ARG"
 }
 
-cmd_next_file() {
-  local dir avail seq ack dest body
-  dir=$(file_stream_dir)
-  [ -d "$dir/available" ] || fail "no messages on stream $STREAM"
-  file_lock_acquire "$dir"
-  avail=
-  for avail in "$dir/available/"[0-9]*; do
-    [ -f "$avail" ] || { avail=; continue; }
-    break
-  done
-  if [ -z "$avail" ]; then
-    file_lock_release "$dir"
-    fail "no messages on stream $STREAM"
-  fi
-  seq=$(basename "$avail")
-  seq=$((10#$seq))
-  ack="a$(pad_seq "$seq")"
-  dest="$dir/pending/$ack"
-  mv "$avail" "$dest"
-  body=$(file_read_body "$dest")
-  SUBJECT=$(awk -F= '/^subject=/ { print substr($0,9); exit }' "$dest")
-  file_lock_release "$dir"
-  printf 'ack=%s\n' "$ack"
-  printf 'seq=%s\n' "$seq"
-  printf 'subject=%s\n' "$SUBJECT"
-  printf -- '--\n'
-  printf '%s' "$body"
-  printf '\n'
+# A peek: the message is negative-acknowledged so it stays pending for ack.
+cmd_next() {
+  fm_carverauto_nats_run consumer next "$STREAM" "$CONSUMER" --count 1 --no-ack --nak --raw \
+    || fail "no pending message on stream $STREAM (consumer $CONSUMER)"
 }
 
-cmd_ack_file() {
-  local dir src dest
-  [ -n "$ACK_ID" ] || die "ack requires --ack"
-  dir=$(file_stream_dir)
-  file_lock_acquire "$dir"
-  src="$dir/pending/$ACK_ID"
-  if [ ! -f "$src" ]; then
-    file_lock_release "$dir"
-    fail "unknown ack id $ACK_ID on stream $STREAM"
-  fi
-  mkdir -p "$dir/handled"
-  dest="$dir/handled/$ACK_ID"
-  mv "$src" "$dest"
-  file_lock_release "$dir"
-  printf 'ack: %s\n' "$ACK_ID"
+# The acknowledgement IS handled: the durable consumer stops offering it.
+cmd_ack() {
+  fm_carverauto_nats_run consumer next "$STREAM" "$CONSUMER" --count 1 --ack --raw \
+    || fail "no pending message to acknowledge on stream $STREAM (consumer $CONSUMER)"
 }
 
-cmd_list_file() {
-  local dir f seq subject
-  dir=$(file_stream_dir)
-  if [ ! -d "$dir" ]; then
-    return 0
-  fi
-  file_lock_acquire "$dir"
-  for f in "$dir/available/"[0-9]*; do
-    [ -f "$f" ] || continue
-    seq=$(basename "$f")
-    seq=$((10#$seq))
-    subject=$(awk -F= '/^subject=/ { print substr($0,9); exit }' "$f")
-    printf 'seq=%s state=pending subject=%s\n' "$seq" "$subject"
-  done
-  for f in "$dir/pending/"*; do
-    [ -f "$f" ] || continue
-    seq=$(awk -F= '/^seq=/ { print $2; exit }' "$f")
-    subject=$(awk -F= '/^subject=/ { print substr($0,9); exit }' "$f")
-    printf 'seq=%s state=pending subject=%s ack=%s\n' "$seq" "$subject" "$(basename "$f")"
-  done
-  file_lock_release "$dir"
+# Pending is the durable consumer's unacked count, never the stream's retained
+# history: an acknowledged steer is handled even while the stream still holds it.
+cmd_list() {
+  local info pending
+  info=$(fm_carverauto_nats_run consumer info "$STREAM" "$CONSUMER" --json) \
+    || fail "nats consumer info failed for consumer $CONSUMER on stream $STREAM"
+  pending=$(printf '%s\n' "$info" | awk '
+    !found && match($0, /"num_pending"[ \t]*:[ \t]*[0-9]+/) {
+      n = substr($0, RSTART, RLENGTH)
+      sub(/^[^0-9]*/, "", n)
+      print n
+      found = 1
+    }
+  ')
+  [ -n "$pending" ] || fail "nats consumer info did not report num_pending for consumer $CONSUMER on stream $STREAM"
+  printf 'stream=%s consumer=%s pending=%s\n' "$STREAM" "$CONSUMER" "$pending"
 }
 
-cmd_put_nats() {
-  local nats bodyfile extra=()
-  nats=$(nats_bin)
-  bodyfile=$(mktemp "${TMPDIR:-/tmp}/fm-carverauto-put.XXXXXX")
-  put_body >"$bodyfile"
-  extra=()
-  while IFS= read -r arg; do
-    [ -n "$arg" ] && extra+=("$arg")
-  done < <(nats_args)
-  "$nats" "${extra[@]}" publish "$SUBJECT" -- "$(cat "$bodyfile")"
-  rm -f "$bodyfile"
-  printf 'put: stream=%s subject=%s backend=nats\n' "$STREAM" "$SUBJECT"
-}
-
-cmd_next_nats() {
-  local nats extra=() out ack_subject ack seq
-  nats=$(nats_bin)
-  extra=()
-  while IFS= read -r arg; do
-    [ -n "$arg" ] && extra+=("$arg")
-  done < <(nats_args)
-  out=$("$nats" "${extra[@]}" consumer next "$STREAM" "$CONSUMER" --no-ack --count 1) || fail "nats consumer next failed"
-  ack_subject=$(printf '%s\n' "$out" | awk '/\$JS\.ACK\./ { print $NF; exit }')
-  if [ -z "$ack_subject" ]; then
-    ack_subject=$(printf '%s\n' "$out" | awk 'BEGIN { IGNORECASE=1 } /ack-subject|Nats-Ack-Subject/ { print $NF; exit }')
-  fi
-  [ -n "$ack_subject" ] || fail "nats consumer next did not expose an ack subject"
-  seq=$(printf '%s\n' "$out" | awk 'BEGIN { IGNORECASE=1 } /Nats-Sequence:|sequence:/ { print $NF; exit }')
-  seq=${seq:-0}
-  ack="n-${seq}-$(printf '%s' "$ack_subject" | tr -c 'A-Za-z0-9._-' '_' | cut -c1-80)"
-  mkdir -p "$(file_stream_dir)/pending"
-  printf '%s\n' "$ack_subject" >"$(file_stream_dir)/pending/$ack"
-  printf 'ack=%s\n' "$ack"
-  printf 'seq=%s\n' "$seq"
-  printf 'subject=%s\n' "$SUBJECT"
-  printf -- '--\n'
-  printf '%s\n' "$out"
-}
-
-cmd_ack_nats() {
-  local nats extra=() subject
-  [ -n "$ACK_ID" ] || die "ack requires --ack"
-  subject=$(cat "$(file_stream_dir)/pending/$ACK_ID" 2>/dev/null || true)
-  [ -n "$subject" ] || fail "unknown ack id $ACK_ID on stream $STREAM"
-  nats=$(nats_bin)
-  extra=()
-  while IFS= read -r arg; do
-    [ -n "$arg" ] && extra+=("$arg")
-  done < <(nats_args)
-  "$nats" "${extra[@]}" publish "$subject" -- ''
-  mkdir -p "$(file_stream_dir)/handled"
-  mv "$(file_stream_dir)/pending/$ACK_ID" "$(file_stream_dir)/handled/$ACK_ID"
-  printf 'ack: %s\n' "$ACK_ID"
-}
-
-cmd_list_nats() {
-  local nats extra=()
-  nats=$(nats_bin)
-  extra=()
-  while IFS= read -r arg; do
-    [ -n "$arg" ] && extra+=("$arg")
-  done < <(nats_args)
-  "$nats" "${extra[@]}" stream view "$STREAM" --raw
-}
-
-case "$BACKEND:$CMD" in
-  file:put) cmd_put_file ;;
-  file:next) cmd_next_file ;;
-  file:ack) cmd_ack_file ;;
-  file:list) cmd_list_file ;;
-  nats:put) cmd_put_nats ;;
-  nats:next) cmd_next_nats ;;
-  nats:ack) cmd_ack_nats ;;
-  nats:list) cmd_list_nats ;;
-  *) die "unsupported $BACKEND $CMD" ;;
+case "$CMD" in
+  put) cmd_put ;;
+  next) cmd_next ;;
+  ack) cmd_ack ;;
+  list) cmd_list ;;
 esac

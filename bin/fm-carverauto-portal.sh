@@ -3,19 +3,20 @@
 #
 # Usage:
 #   fm-carverauto-portal.sh assign --stream <name> --task-id <id> --worker <name> \
-#     [--pr-url <https-url>] [--issue-url <https-url>] [--buildbuddy-url <https-url>] \
-#     [--subject <subject>]
+#     [--pr-url <https-url>] [--issue-url <https-url>] [--buildbuddy-url <https-url>]
 #
 # --stream is required. Task id and worker are required. Any URL that is
 # supplied must be a full https URL (PR, issue, or BuildBuddy check).
-# The payload is JSON schema fm-carverauto-portal-assign.v1 and is published
-# through bin/fm-carverauto-inbox.sh put, so the on-disk steering inbox is
-# never touched.
 #
-# Default subject: firstmate.portal.assign
+# An assignment is its own message family, not a steer: subject
+# firstmate.assign.<task-id>, JSON payload schema
+# fm-carverauto-portal-assign.v1. It is published here rather than through
+# bin/fm-steer.sh, whose subject and schema are pinned to the steering-inbox
+# contract. Nothing on this path touches the on-disk steering inbox.
+#
 # Default portal_url: https://firstmate.carverauto.dev
-# bin/fm-carverauto-lib.sh owns overlay opt-in and URL resolution.
-# The carverauto-overlay skill owns when firstmate must publish.
+# bin/fm-carverauto-lib.sh owns overlay opt-in, URL resolution, and the nats
+# invocation. The carverauto-overlay skill owns when firstmate must publish.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -40,7 +41,6 @@ WORKER=
 PR_URL=
 ISSUE_URL=
 BB_URL=
-SUBJECT=firstmate.portal.assign
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -80,11 +80,6 @@ while [ "$#" -gt 0 ]; do
       BB_URL=$2
       shift 2
       ;;
-    --subject)
-      [ -n "${2-}" ] || die "--subject needs a value"
-      SUBJECT=$2
-      shift 2
-      ;;
     --) shift; break ;;
     -*) die "unknown option: $1" ;;
     *) die "unexpected argument: $1" ;;
@@ -93,7 +88,9 @@ done
 
 [ "$CMD" = assign ] || die "command required: assign"
 [ -n "$STREAM" ] || die "--stream is required"
+fm_carverauto_valid_token "$STREAM" || die "invalid --stream (use a NATS-safe token, no path separators)"
 [ -n "$TASK_ID" ] || die "--task-id is required"
+fm_carverauto_valid_token "$TASK_ID" || die "invalid --task-id (use a NATS-safe token, no path separators)"
 [ -n "$WORKER" ] || die "--worker is required"
 
 require_https_opt() {
@@ -109,15 +106,15 @@ command -v python3 >/dev/null 2>&1 || die "python3 is required to encode the ass
 
 PORTAL=$(fm_carverauto_portal_url)
 AT=$(fm_carverauto_now)
-PAYLOAD=$(python3 - "$TASK_ID" "$WORKER" "$PR_URL" "$ISSUE_URL" "$BB_URL" "$PORTAL" "$AT" <<'PY'
+PAYLOAD=$(python3 - "$TASK_ID" "$WORKER" "$PR_URL" "$ISSUE_URL" "$BB_URL" "$PORTAL" "$AT" "$FM_CARVERAUTO_PORTAL_SCHEMA" <<'PY'
 import json, sys
-task, worker, pr, issue, bb, portal, at = sys.argv[1:8]
+task, worker, pr, issue, bb, portal, at, schema = sys.argv[1:9]
 
 def opt(v):
     return v if v else None
 
 print(json.dumps({
-    "schema": "fm-carverauto-portal-assign.v1",
+    "schema": schema,
     "task_id": task,
     "worker": worker,
     "pr_url": opt(pr),
@@ -129,8 +126,7 @@ print(json.dumps({
 PY
 )
 
-printf '%s' "$PAYLOAD" | "$SCRIPT_DIR/fm-carverauto-inbox.sh" put \
-  --stream "$STREAM" \
-  --subject "$SUBJECT" \
-  --schema "$FM_CARVERAUTO_PORTAL_SCHEMA" \
-  --task "$TASK_ID"
+SUBJECT="firstmate.assign.${TASK_ID}"
+fm_carverauto_nats_run publish "$SUBJECT" -- "$PAYLOAD" >&2 \
+  || { printf 'error: nats publish to %s failed\n' "$SUBJECT" >&2; exit 1; }
+printf 'assign: stream=%s subject=%s task=%s worker=%s\n' "$STREAM" "$SUBJECT" "$TASK_ID" "$WORKER"

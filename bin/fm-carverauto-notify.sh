@@ -4,7 +4,7 @@
 # Usage:
 #   fm-carverauto-notify.sh captain-needed --title <text> [--body <text>] [--file <path>]... [--no-portal]
 #   fm-carverauto-notify.sh pr-landed --url <https-url> --outcome <text>
-#   fm-carverauto-notify.sh archify --title <text> [--png <path>] [--notes <text>] [--html <path>]
+#   fm-carverauto-notify.sh archify --title <text> (--png <path> | --html <path>) [--notes <text>]
 #
 # Wraps python3 notify.py from firstmate-notify. The Discord webhook token is
 # never read, printed, or stored by this script: notify.py loads
@@ -143,6 +143,10 @@ case "$CMD" in
     ;;
   archify)
     [ -n "$TITLE" ] || die "archify requires --title"
+    # A diagram page carries the diagram. A text-only page is captain-needed,
+    # under that name, so the caller always knows which page Discord gets.
+    [ -n "$HTML" ] || [ -n "$PNG" ] \
+      || die "archify requires --png or --html (use captain-needed for a text page)"
     NOTES=$(append_portal "$NOTES")
     args=(archify --title "$TITLE" --notes "$NOTES")
     # Discord does not render HTML; the portal URL is the live diagram.
@@ -153,10 +157,6 @@ case "$CMD" in
     if [ -n "$PNG" ]; then
       args+=(--png "$PNG")
     fi
-    if [ -z "$HTML" ] && [ -z "$PNG" ]; then
-      run_notify captain-needed --title "$TITLE" --body "$NOTES"
-    else
-      run_notify "${args[@]}"
-    fi
+    run_notify "${args[@]}"
     ;;
 esac

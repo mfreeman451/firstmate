@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # tests/fm-carverauto-overlay.test.sh - Carverauto fork overlay CLIs.
 #
-# Drives the public notify, inbox, and portal executables plus fm-send's
-# additive dual-write. The file-backed inbox is the executable contract;
-# a stub nats binary pins the nats backend argv. Discord tokens never appear
-# on argv or in wrapper output.
+# Drives the public notify, steer, and portal executables plus fm-send's
+# additive dual-write. JetStream is the steer inbox's only store, so a fake
+# nats broker (publish into a directory, one durable consumer served from it)
+# stands in for the server and lets put/next/ack/list be asserted end to end.
+# Discord tokens never appear on argv or in wrapper output.
 # shellcheck disable=SC2016
 set -u
 
@@ -12,7 +13,7 @@ set -u
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 NOTIFY="$ROOT/bin/fm-carverauto-notify.sh"
-INBOX="$ROOT/bin/fm-steer.sh"
+STEER="$ROOT/bin/fm-steer.sh"
 PORTAL="$ROOT/bin/fm-carverauto-portal.sh"
 SEND="$ROOT/bin/fm-send.sh"
 
@@ -34,6 +35,65 @@ with open(log, "a", encoding="utf-8") as f:
 print("sent", sys.argv[1] if len(sys.argv) > 1 else "unknown")
 PY
   chmod +x "$dir/notify.py"
+}
+
+# A fake NATS server for the subset of the CLI the overlay uses: publish stores
+# subject+body under $NATS_STORE/msgs, `consumer next` serves the head of the
+# one durable consumer (acknowledging only when --ack advances its floor), and
+# `consumer info --json` reports what that consumer has not acknowledged.
+make_nats_stub() {  # <dir>
+  local fb="$1/fakebin"
+  mkdir -p "$fb"
+  cat >"$fb/nats" <<'SH'
+#!/usr/bin/env bash
+set -u
+store=${NATS_STORE:?NATS_STORE is required}
+mkdir -p "$store/msgs"
+args=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -s|--server)
+      printf 'server=%s\n' "${2:-}" >>"$store/argv.log"
+      shift 2 ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+printf 'argv=%s\n' "$(printf '%s ' "${args[@]+"${args[@]}"}")" >>"$store/argv.log"
+stored() { ls -1 "$store/msgs"/*.body 2>/dev/null | wc -l | tr -d ' '; }
+floor() { cat "$store/floor" 2>/dev/null || printf '0'; }
+case "${args[0]:-}" in
+  publish)
+    n=$(( $(stored) + 1 ))
+    printf '%s' "${args[1]}" >"$store/msgs/$(printf '%04d' "$n").subject"
+    printf '%s' "${args[$(( ${#args[@]} - 1 ))]}" >"$store/msgs/$(printf '%04d' "$n").body"
+    exit 0 ;;
+  consumer)
+    case "${args[1]:-}" in
+      next)
+        ack=0
+        for a in "${args[@]}"; do
+          case "$a" in --ack) ack=1 ;; esac
+        done
+        n=$(( $(floor) + 1 ))
+        [ -f "$store/msgs/$(printf '%04d' "$n").body" ] \
+          || { printf 'nats: no message\n' >&2; exit 1; }
+        cat "$store/msgs/$(printf '%04d' "$n").body"
+        printf '\n'
+        if [ "$ack" = 1 ]; then
+          printf '%s' "$n" >"$store/floor"
+        fi
+        exit 0 ;;
+      info)
+        printf '{"stream_name":"%s","name":"%s","num_ack_pending":0,"num_pending":%s}\n' \
+          "${args[2]:-}" "${args[3]:-}" "$(( $(stored) - $(floor) ))"
+        exit 0 ;;
+    esac
+    ;;
+esac
+printf 'nats: unsupported command: %s\n' "${args[*]:-}" >&2
+exit 2
+SH
+  chmod +x "$fb/nats"
 }
 
 make_tmux_stubs() {  # <dir>
@@ -73,72 +133,162 @@ SH
   chmod +x "$fb/sleep"
 }
 
+# steer <dir> -- <fm-steer args...>: run the CLI against that dir's fake broker.
+steer() {
+  local dir=$1; shift
+  env PATH="$dir/fakebin:$PATH" FM_HOME="$dir/home" \
+    NATS_STORE="$dir/nats" FM_CARVERAUTO_NATS_URL=nats://127.0.0.1:4222 \
+    "$STEER" "$@"
+}
+
+# The nth published message, "<subject>\n<payload>".
+published() {  # <dir> <n>
+  local f
+  f="$1/nats/msgs/$(printf '%04d' "$2")"
+  [ -f "$f.body" ] || return 1
+  printf '%s\n' "$(cat "$f.subject")"
+  cat "$f.body"
+}
+
+published_count() {  # <dir>
+  ls -1 "$1/nats/msgs"/*.body 2>/dev/null | wc -l | tr -d ' '
+}
+
+# The body of an envelope or of a next/ack payload: everything after the "--".
+envelope_body() {
+  awk 'seen { print } $0 == "--" { seen=1 }'
+}
+
+setup_overlay_dir() {  # <name> -> echoes a dir with fakebin, home, and store
+  local dir="$TMP_ROOT/$1"
+  mkdir -p "$dir/home/state" "$dir/home/config" "$dir/nats/msgs"
+  make_nats_stub "$dir"
+  printf '%s\n' "$dir"
+}
+
 test_stream_required() {
-  local home err rc
-  home="$TMP_ROOT/stream-required"
-  mkdir -p "$home/state"
-  err="$home/err"
+  local dir err rc
+  dir=$(setup_overlay_dir stream-required)
+  err="$dir/err"
   set +e
-  FM_HOME="$home" FM_CARVERAUTO_INBOX_BACKEND=file \
-    "$INBOX" put >/dev/null 2>"$err"
+  steer "$dir" put >/dev/null 2>"$err"
   rc=$?
   set -e
   expect_code 2 "$rc" "put without --stream must refuse"
   assert_contains "$(cat "$err")" "--stream is required" "put should name the missing stream"
-  pass "inbox CLI: --stream is required"
+  pass "fm-steer: --stream is required"
 }
 
-test_put_next_ack_list_file_backend() {
-  local home store out err ack body listed
-  home="$TMP_ROOT/inbox-file"
-  store="$home/state/carverauto-inbox"
-  mkdir -p "$home/state"
-  out=$(printf 'steer body\nline 2' | FM_HOME="$home" FM_CARVERAUTO_INBOX_BACKEND=file \
-    "$INBOX" put --stream firstmate --task t1)
+test_put_publishes_the_full_envelope() {
+  local dir out msg
+  dir=$(setup_overlay_dir put-envelope)
+  out=$(printf 'steer body\nline 2' | steer "$dir" put --stream firstmate --task t1 --seq 3)
   assert_contains "$out" "stream=firstmate" "put should name the stream"
-  assert_contains "$out" "seq=1" "first put should be seq 1"
-  listed=$(FM_HOME="$home" FM_CARVERAUTO_INBOX_BACKEND=file \
-    "$INBOX" list --stream firstmate)
-  assert_contains "$listed" "state=pending" "list should show pending (unacked) messages"
-  assert_contains "$listed" "firstmate.steer.t1" "put should use firstmate.steer.<task>"
-  stored=$(cat "$store/firstmate/available/"*)
-  assert_contains "$stored" "schema=fm-task-inbox.v1" "payload schema is fm-task-inbox.v1"
-  assert_contains "$stored" "task=t1" "payload includes task"
-  assert_contains "$stored" $'seq=1\n' "payload includes seq"
-  out=$(FM_HOME="$home" FM_CARVERAUTO_INBOX_BACKEND=file \
-    "$INBOX" next --stream firstmate)
-  ack=$(printf '%s\n' "$out" | awk -F= '/^ack=/ { print $2; exit }')
-  [ -n "$ack" ] || fail "next should print an ack id"
-  body=$(printf '%s\n' "$out" | awk 'seen { print } $0 == "--" { seen=1 }')
-  [ "$body" = $'steer body\nline 2' ] || fail "next body did not round-trip: $body"
-  FM_HOME="$home" FM_CARVERAUTO_INBOX_BACKEND=file \
-    "$INBOX" ack --stream firstmate --ack "$ack" >/dev/null
-  listed=$(FM_HOME="$home" FM_CARVERAUTO_INBOX_BACKEND=file \
-    "$INBOX" list --stream firstmate)
-  [ -z "$listed" ] || fail "list should be empty after ack, got: $listed"
-  [ -d "$store/firstmate" ] || fail "file store should exist under state/carverauto-inbox"
-  pass "inbox CLI: file backend put/next/ack/list round-trips the body"
+  assert_contains "$out" "subject=firstmate.steer.t1" "put should use firstmate.steer.<task>"
+  msg=$(published "$dir" 1) || fail "put published nothing"
+  assert_contains "$msg" "firstmate.steer.t1" "the published subject is firstmate.steer.<task>"
+  assert_contains "$msg" "schema=fm-task-inbox.v1" "the payload carries the pinned schema"
+  assert_contains "$msg" $'\ntask=t1\n' "the payload carries the task"
+  assert_contains "$msg" $'\nseq=3\n' "the payload carries the record sequence"
+  assert_contains "$msg" 'at=' "the payload carries the enqueue time"
+  [ "$(printf '%s\n' "$msg" | envelope_body)" = $'steer body\nline 2' ] \
+    || fail "the payload body did not survive the publish: $msg"
+  assert_contains "$(cat "$dir/nats/argv.log")" "server=nats://127.0.0.1:4222" \
+    "the configured NATS URL should reach the nats CLI"
+  pass "fm-steer: put publishes the whole fm-task-inbox.v1 envelope"
+}
+
+test_put_marks_fire_and_forget() {
+  local dir msg
+  dir=$(setup_overlay_dir put-fire)
+  steer "$dir" put --stream firstmate --task t1 --seq 1 \
+    --delivery fire-and-forget --body "one shot" >/dev/null
+  msg=$(published "$dir" 1) || fail "put published nothing"
+  assert_contains "$msg" $'\ndelivery=fire-and-forget\n' \
+    "a fire-and-forget steer is marked on the JetStream copy"
+  pass "fm-steer: put carries the optional fire-and-forget marker"
+}
+
+test_put_requires_the_contract_fields() {
+  local dir err rc
+  dir=$(setup_overlay_dir put-required)
+  err="$dir/err"
+  set +e
+  steer "$dir" put --stream firstmate --body x >/dev/null 2>"$err"
+  rc=$?
+  set -e
+  expect_code 2 "$rc" "a put with no task must refuse"
+  assert_contains "$(cat "$err")" "--task" "the refusal should name --task"
+  set +e
+  steer "$dir" put --stream firstmate --task t1 --body x >/dev/null 2>"$err"
+  rc=$?
+  set -e
+  expect_code 2 "$rc" "a put with no seq must refuse"
+  assert_contains "$(cat "$err")" "--seq" "the refusal should name --seq"
+  [ "$(published_count "$dir")" = 0 ] || fail "a refused put must publish nothing"
+  pass "fm-steer: put refuses an envelope it cannot complete"
+}
+
+test_steer_subject_and_schema_are_pinned() {
+  local dir err rc flag
+  dir=$(setup_overlay_dir pinned)
+  err="$dir/err"
+  for flag in --subject --schema --id; do
+    set +e
+    steer "$dir" put --stream firstmate --task t1 --seq 1 "$flag" x --body y \
+      >/dev/null 2>"$err"
+    rc=$?
+    set -e
+    expect_code 2 "$rc" "fm-steer must refuse $flag"
+    assert_contains "$(cat "$err")" "unknown option: $flag" \
+      "the refusal should name the rejected flag"
+  done
+  [ "$(published_count "$dir")" = 0 ] || fail "a refused put must publish nothing"
+  pass "fm-steer: the steer subject and schema cannot be overridden"
+}
+
+test_next_peeks_and_ack_handles() {
+  local dir out
+  dir=$(setup_overlay_dir next-ack)
+  steer "$dir" put --stream firstmate --task t1 --seq 1 --body "please rebase" >/dev/null
+  steer "$dir" put --stream firstmate --task t2 --seq 1 --body "second steer" >/dev/null
+  assert_contains "$(steer "$dir" list --stream firstmate)" "pending=2" \
+    "list should report both unacknowledged steers"
+  out=$(steer "$dir" next --stream firstmate)
+  assert_contains "$out" "schema=fm-task-inbox.v1" "next should return the published envelope"
+  [ "$(printf '%s\n' "$out" | envelope_body)" = "please rebase" ] \
+    || fail "next did not round-trip the body: $out"
+  assert_contains "$(steer "$dir" list --stream firstmate)" "pending=2" \
+    "next alone must not mark a steer handled"
+  steer "$dir" ack --stream firstmate >/dev/null
+  assert_contains "$(steer "$dir" list --stream firstmate)" "pending=1" \
+    "ack is what marks a steer handled"
+  steer "$dir" ack --stream firstmate >/dev/null
+  assert_contains "$(steer "$dir" list --stream firstmate)" "pending=0" \
+    "list is the consumer's unacked count, not the stream's history"
+  pass "fm-steer: next peeks, ack handles, list is pending"
 }
 
 test_inbox_does_not_touch_task_disk_inbox() {
-  local home rec checksum after
-  home="$TMP_ROOT/disk-guard"
-  mkdir -p "$home/state/t1.inbox"
-  rec="$home/state/t1.inbox/001.msg"
+  local dir rec checksum after
+  dir=$(setup_overlay_dir disk-guard)
+  mkdir -p "$dir/home/state/t1.inbox"
+  rec="$dir/home/state/t1.inbox/001.msg"
   printf 'schema=fm-task-inbox.v1\nat=now\n--\nkeep me\n' >"$rec"
   checksum=$(cksum "$rec")
-  printf 'overlay' | FM_HOME="$home" FM_CARVERAUTO_INBOX_BACKEND=file \
-    "$INBOX" put --stream firstmate >/dev/null
-  FM_HOME="$home" FM_CARVERAUTO_INBOX_BACKEND=file \
-    "$INBOX" next --stream firstmate >/dev/null
+  steer "$dir" put --stream firstmate --task t1 --seq 1 --body "overlay" >/dev/null
+  steer "$dir" next --stream firstmate >/dev/null
+  steer "$dir" ack --stream firstmate >/dev/null
   [ -f "$rec" ] || fail "the on-disk task inbox was removed"
   after=$(cksum "$rec")
   [ "$checksum" = "$after" ] || fail "the on-disk task inbox was modified"
-  pass "inbox CLI: never deletes or mutates a task on-disk inbox"
+  [ ! -d "$dir/home/state/carverauto-inbox" ] \
+    || fail "the overlay must not keep a message store of its own"
+  pass "fm-steer: never deletes or mutates a task on-disk inbox"
 }
 
 test_notify_captain_needed_includes_portal_and_hides_token() {
-  local home stub log out err
+  local home stub log out
   home="$TMP_ROOT/notify"
   stub="$home/notify.py"
   log="$home/notify.log"
@@ -147,7 +297,6 @@ test_notify_captain_needed_includes_portal_and_hides_token() {
   out=$(DISCORD_WEBHOOK_URL='https://discord.com/api/webhooks/SECRETTOKEN/please-never-print' \
     FM_CARVERAUTO_NOTIFY_PY="$stub" NOTIFY_LOG="$log" \
     "$NOTIFY" captain-needed --title "Need a token" --body "Publish is blocked." )
-  err=""
   assert_contains "$out" "sent captain-needed" "wrapper should report the notify.py result"
   assert_not_contains "$out" "SECRETTOKEN" "wrapper stdout must never contain the webhook"
   assert_not_contains "$(cat "$log")" "SECRETTOKEN" "notify.py argv must never contain the webhook"
@@ -157,7 +306,7 @@ test_notify_captain_needed_includes_portal_and_hides_token() {
 }
 
 test_notify_pr_landed_rejects_bare_number() {
-  local home stub log rc err
+  local home log rc err
   home="$TMP_ROOT/notify-pr"
   mkdir -p "$home"
   make_notify_stub "$home"
@@ -173,128 +322,142 @@ test_notify_pr_landed_rejects_bare_number() {
   pass "notify: pr-landed requires a full https URL"
 }
 
-test_portal_assign_publishes_json() {
-  local home out body
-  home="$TMP_ROOT/portal"
-  mkdir -p "$home/state"
-  out=$(FM_HOME="$home" FM_CARVERAUTO_INBOX_BACKEND=file \
+test_notify_archify_requires_a_diagram() {
+  local home log err rc out
+  home="$TMP_ROOT/notify-archify"
+  mkdir -p "$home"
+  make_notify_stub "$home"
+  log="$home/notify.log"
+  err="$home/err"
+  set +e
+  FM_CARVERAUTO_NOTIFY_PY="$home/notify.py" NOTIFY_LOG="$log" \
+    "$NOTIFY" archify --title "Fleet map" --notes "no attachment" >/dev/null 2>"$err"
+  rc=$?
+  set -e
+  expect_code 2 "$rc" "archify without a diagram must refuse"
+  assert_contains "$(cat "$err")" "--png" "the refusal should name the missing attachment"
+  [ ! -s "$log" ] || fail "a refused archify must not page Discord: $(cat "$log")"
+  : >"$home/map.png"
+  out=$(FM_CARVERAUTO_NOTIFY_PY="$home/notify.py" NOTIFY_LOG="$log" \
+    "$NOTIFY" archify --title "Fleet map" --png "$home/map.png")
+  assert_contains "$out" "sent archify" "archify with a diagram runs notify.py archify"
+  assert_contains "$(cat "$log")" "--png" "the diagram should reach notify.py"
+  pass "notify: archify pages as archify or refuses, never as captain-needed"
+}
+
+test_portal_assign_publishes_its_own_family() {
+  local dir out msg
+  dir=$(setup_overlay_dir portal)
+  out=$(env PATH="$dir/fakebin:$PATH" FM_HOME="$dir/home" \
+    NATS_STORE="$dir/nats" FM_CARVERAUTO_NATS_URL=nats://127.0.0.1:4222 \
     "$PORTAL" assign --stream firstmate --task-id t1 --worker grok \
     --pr-url https://github.com/mfreeman451/firstmate/pull/1 \
     --buildbuddy-url https://app.buildbuddy.io/invocation/abc)
-  assert_contains "$out" "stream=firstmate" "portal assign should put onto the stream"
-  body=$(FM_HOME="$home" FM_CARVERAUTO_INBOX_BACKEND=file \
-    "$INBOX" next --stream firstmate | awk 'seen { print } $0 == "--" { seen=1 }')
-  assert_contains "$body" '"schema":"fm-carverauto-portal-assign.v1"' "payload should use the assignment schema"
-  assert_contains "$body" '"task_id":"t1"' "payload should include the task id"
-  assert_contains "$body" '"worker":"grok"' "payload should include the worker"
-  assert_contains "$body" 'https://github.com/mfreeman451/firstmate/pull/1' "payload should include the PR URL"
-  assert_contains "$body" 'https://app.buildbuddy.io/invocation/abc' "payload should include the BuildBuddy URL"
-  assert_contains "$body" 'https://firstmate.carverauto.dev' "payload should include the portal URL"
-  pass "portal: assign publishes task, worker, and https URLs onto the stream"
+  assert_contains "$out" "stream=firstmate" "portal assign should name the stream"
+  assert_contains "$out" "subject=firstmate.assign.t1" "an assignment is its own subject family"
+  msg=$(published "$dir" 1) || fail "portal assign published nothing"
+  assert_not_contains "$msg" "firstmate.steer" "an assignment must not ride the steer subject"
+  assert_contains "$msg" '"schema":"fm-carverauto-portal-assign.v1"' "payload should use the assignment schema"
+  assert_contains "$msg" '"task_id":"t1"' "payload should include the task id"
+  assert_contains "$msg" '"worker":"grok"' "payload should include the worker"
+  assert_contains "$msg" 'https://github.com/mfreeman451/firstmate/pull/1' "payload should include the PR URL"
+  assert_contains "$msg" 'https://app.buildbuddy.io/invocation/abc' "payload should include the BuildBuddy URL"
+  assert_contains "$msg" 'https://firstmate.carverauto.dev' "payload should include the portal URL"
+  pass "portal: assign publishes task, worker, and https URLs on firstmate.assign.<task>"
 }
 
 test_portal_rejects_non_https() {
-  local home err rc
-  home="$TMP_ROOT/portal-bad"
-  mkdir -p "$home/state"
-  err="$home/err"
+  local dir err rc
+  dir=$(setup_overlay_dir portal-bad)
+  err="$dir/err"
   set +e
-  FM_HOME="$home" FM_CARVERAUTO_INBOX_BACKEND=file \
+  env PATH="$dir/fakebin:$PATH" FM_HOME="$dir/home" NATS_STORE="$dir/nats" \
     "$PORTAL" assign --stream firstmate --task-id t1 --worker grok \
     --issue-url http://example.invalid/issues/1 >/dev/null 2>"$err"
   rc=$?
   set -e
   expect_code 2 "$rc" "http issue URLs must be refused"
+  [ "$(published_count "$dir")" = 0 ] || fail "a refused assignment must publish nothing"
   pass "portal: issue URLs must be https"
 }
 
+# run_send <dir> -- <fm-send args...>: fm-send against that dir's home, with the
+# tmux and nats stubs on PATH and the overlay's store pinned to the dir.
+run_send() {
+  local dir=$1; shift
+  env PATH="$dir/fakebin:$PATH" \
+    FM_ROOT_OVERRIDE="$dir/home" FM_HOME="$dir/home" FM_SEND_LOG="$dir/send.log" \
+    FM_SEND_SETTLE=0 NATS_STORE="$dir/nats" \
+    FM_CARVERAUTO_NATS_URL=nats://127.0.0.1:4222 \
+    "$SEND" "$@"
+}
+
 test_send_dual_write_keeps_disk_inbox() {
-  local dir rec listed body
-  dir="$TMP_ROOT/send-dual"
-  mkdir -p "$dir/home/state" "$dir/home/config"
+  local dir rec body msg
+  dir=$(setup_overlay_dir send-dual)
   make_tmux_stubs "$dir"
   fm_write_meta "$dir/home/state/t1.meta" "window=sess:fm-t1" "kind=ship" "harness=claude"
   printf 'on\n' >"$dir/home/config/carverauto-overlay"
   printf 'firstmate\n' >"$dir/home/config/carverauto-inbox-stream"
   : >"$dir/send.log"
-  env PATH="$dir/fakebin:$PATH" \
-    FM_ROOT_OVERRIDE="$dir/home" FM_HOME="$dir/home" FM_SEND_LOG="$dir/send.log" \
-    FM_SEND_SETTLE=0 FM_CARVERAUTO_INBOX_BACKEND=file \
-    "$SEND" t1 "please rebase onto main" >/dev/null
+  run_send "$dir" t1 "please rebase onto main" >/dev/null
   rec="$dir/home/state/t1.inbox/001.msg"
   [ -f "$rec" ] || fail "dual-write must not skip the on-disk inbox"
   body=$(bash -c '. "$1"; fm_task_inbox_body "$2"' _ "$ROOT/bin/fm-task-inbox-lib.sh" "$rec")
   [ "$body" = "please rebase onto main" ] || fail "disk inbox body changed: $body"
-  listed=$(FM_HOME="$dir/home" FM_CARVERAUTO_INBOX_BACKEND=file \
-    "$INBOX" list --stream firstmate)
-  assert_contains "$listed" "state=pending" "fm-send should dual-write onto the overlay stream"
-  assert_contains "$listed" "firstmate.steer.t1" "dual-write subject is firstmate.steer.<task>"
-  stored=$(cat "$dir/home/state/carverauto-inbox/firstmate/available/"*)
-  assert_contains "$stored" "schema=fm-task-inbox.v1" "dual-write payload uses the on-disk inbox schema"
+  msg=$(published "$dir" 1) || fail "fm-send did not dual-write onto JetStream"
+  assert_contains "$msg" "firstmate.steer.t1" "dual-write subject is firstmate.steer.<task>"
+  assert_contains "$msg" "schema=fm-task-inbox.v1" "dual-write payload uses the inbox schema"
+  assert_contains "$msg" $'\nseq=1\n' "dual-write carries the disk record's sequence"
+  [ "$(printf '%s\n' "$msg" | envelope_body)" = "please rebase onto main" ] \
+    || fail "dual-write body diverged from the disk record: $msg"
   pass "fm-send: overlay dual-write is additive and keeps the on-disk inbox"
 }
 
+test_send_idempotent_resend_publishes_once() {
+  local dir delivery
+  dir=$(setup_overlay_dir send-idempotent)
+  make_tmux_stubs "$dir"
+  fm_write_secondmate_meta "$dir/home/state/s1.meta" "$dir/home" "sess:fm-s1" alpha claude
+  printf 'on\n' >"$dir/home/config/carverauto-overlay"
+  printf 'firstmate\n' >"$dir/home/config/carverauto-inbox-stream"
+  : >"$dir/send.log"
+  delivery=0123456789abcdef
+  run_send "$dir" s1 --fire-and-forget "$delivery" "reconcile your own books" >/dev/null \
+    || fail "the first fire-and-forget send failed"
+  run_send "$dir" s1 --fire-and-forget "$delivery" "reconcile your own books" >/dev/null \
+    || fail "the fire-and-forget retry failed"
+  [ "$(ls -1 "$dir/home/state/s1.inbox"/*.msg | wc -l | tr -d ' ')" = 1 ] \
+    || fail "the retry duplicated the on-disk record"
+  [ "$(published_count "$dir")" = 1 ] \
+    || fail "the retry duplicated the JetStream copy of a deduplicated steer"
+  pass "fm-send: a deduplicated resend does not publish a second steer"
+}
+
 test_send_without_overlay_skips_dual_write() {
-  local dir listed
-  dir="$TMP_ROOT/send-plain"
-  mkdir -p "$dir/home/state"
+  local dir
+  dir=$(setup_overlay_dir send-plain)
   make_tmux_stubs "$dir"
   fm_write_meta "$dir/home/state/t1.meta" "window=sess:fm-t1" "kind=ship" "harness=claude"
   : >"$dir/send.log"
-  env PATH="$dir/fakebin:$PATH" \
-    FM_ROOT_OVERRIDE="$dir/home" FM_HOME="$dir/home" FM_SEND_LOG="$dir/send.log" \
-    FM_SEND_SETTLE=0 \
-    "$SEND" t1 "ordinary steer" >/dev/null
+  run_send "$dir" t1 "ordinary steer" >/dev/null
   [ -f "$dir/home/state/t1.inbox/001.msg" ] || fail "plain send must still write the disk inbox"
-  [ ! -d "$dir/home/state/carverauto-inbox" ] || fail "overlay store should stay absent when overlay is off"
+  [ "$(published_count "$dir")" = 0 ] || fail "overlay off must publish nothing"
   pass "fm-send: overlay off leaves the disk inbox as the only store"
 }
 
-test_put_body_flag_matches_openspec() {
-  local home listed body
-  home="$TMP_ROOT/put-body"
-  mkdir -p "$home/state"
-  FM_HOME="$home" FM_CARVERAUTO_INBOX_BACKEND=file \
-    "$INBOX" put --stream firstmate-steer --task fm-hub --body "please rebase" >/dev/null
-  listed=$(FM_HOME="$home" FM_CARVERAUTO_INBOX_BACKEND=file \
-    "$INBOX" list --stream firstmate-steer)
-  assert_contains "$listed" "firstmate.steer.fm-hub" "OpenSpec put uses firstmate.steer.<task>"
-  body=$(FM_HOME="$home" FM_CARVERAUTO_INBOX_BACKEND=file \
-    "$INBOX" next --stream firstmate-steer | awk 'seen { print } $0 == "--" { seen=1 }')
-  [ "$body" = "please rebase" ] || fail "--body did not round-trip: $body"
-  pass "inbox CLI: put --stream --task --body matches the OpenSpec agent publish"
-}
-
-test_nats_backend_put_uses_nats_cli() {
-  local home fb log out
-  home="$TMP_ROOT/nats-put"
-  fb="$home/fakebin"
-  log="$home/nats.log"
-  mkdir -p "$fb" "$home/state"
-  cat >"$fb/nats" <<'SH'
-#!/usr/bin/env bash
-printf '%s\n' "$@" >> "$NATS_LOG"
-exit 0
-SH
-  chmod +x "$fb/nats"
-  out=$(printf 'hello' | PATH="$fb:$PATH" FM_HOME="$home" \
-    FM_CARVERAUTO_INBOX_BACKEND=nats FM_CARVERAUTO_NATS_URL=nats://127.0.0.1:4222 \
-    NATS_LOG="$log" "$INBOX" put --stream firstmate --task t1)
-  assert_contains "$out" "backend=nats" "nats put should name the backend"
-  assert_contains "$(cat "$log")" "publish" "nats CLI should be invoked to publish"
-  assert_contains "$(cat "$log")" "firstmate.steer.t1" "publish subject should be firstmate.steer.<task>"
-  assert_contains "$(cat "$log")" "--server" "NATS URL should be passed to nats"
-  pass "inbox CLI: nats backend put calls the nats CLI"
-}
-
 test_stream_required
-test_put_next_ack_list_file_backend
+test_put_publishes_the_full_envelope
+test_put_marks_fire_and_forget
+test_put_requires_the_contract_fields
+test_steer_subject_and_schema_are_pinned
+test_next_peeks_and_ack_handles
 test_inbox_does_not_touch_task_disk_inbox
 test_notify_captain_needed_includes_portal_and_hides_token
 test_notify_pr_landed_rejects_bare_number
-test_portal_assign_publishes_json
+test_notify_archify_requires_a_diagram
+test_portal_assign_publishes_its_own_family
 test_portal_rejects_non_https
 test_send_dual_write_keeps_disk_inbox
+test_send_idempotent_resend_publishes_once
 test_send_without_overlay_skips_dual_write
-test_put_body_flag_matches_openspec
-test_nats_backend_put_uses_nats_cli

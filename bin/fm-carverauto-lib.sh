@@ -18,8 +18,11 @@ _FM_CARVERAUTO_ROOT="$(cd "$_FM_CARVERAUTO_LIB_DIR/.." && pwd)"
 
 FM_CARVERAUTO_PORTAL_DEFAULT='https://firstmate.carverauto.dev'
 FM_CARVERAUTO_NOTIFY_PY_DEFAULT="$HOME/src/firstmate-notify/notify.py"
+# The portal assignment is its own message family, never the steer contract:
+# subject firstmate.assign.<task>, schema below. bin/fm-carverauto-portal.sh
+# is its only publisher; bin/fm-carverauto-inbox.sh publishes steers only.
+# shellcheck disable=SC2034 # Read by the sourcing publisher.
 FM_CARVERAUTO_PORTAL_SCHEMA='fm-carverauto-portal-assign.v1'
-export FM_CARVERAUTO_PORTAL_SCHEMA
 
 fm_carverauto_home() {
   printf '%s' "${FM_HOME:-$_FM_CARVERAUTO_ROOT}"
@@ -27,10 +30,6 @@ fm_carverauto_home() {
 
 fm_carverauto_config_dir() {
   printf '%s' "${FM_CONFIG_OVERRIDE:-$(fm_carverauto_home)/config}"
-}
-
-fm_carverauto_state_dir() {
-  printf '%s' "${FM_STATE_OVERRIDE:-$(fm_carverauto_home)/state}"
 }
 
 # Read one gitignored config leaf. Env wins when the matching override is set
@@ -108,39 +107,31 @@ fm_carverauto_inbox_stream() {
   fm_carverauto_config_read carverauto-inbox-stream
 }
 
-fm_carverauto_inbox_dir() {
-  if [ -n "${FM_CARVERAUTO_INBOX_DIR:-}" ]; then
-    printf '%s' "$FM_CARVERAUTO_INBOX_DIR"
-    return 0
+# ONE owner of the nats CLI invocation. Only the configured server URL rides
+# argv; credentials stay in the CLI's own environment (NATS_USER,
+# NATS_PASSWORD, NATS_CREDS) so they never reach a process listing or a log.
+fm_carverauto_nats_run() {  # <nats-args...>
+  local url
+  if ! command -v nats >/dev/null 2>&1; then
+    echo "error: nats CLI not found on PATH; install nats or turn the Carverauto overlay off" >&2
+    return 127
   fi
-  printf '%s' "$(fm_carverauto_state_dir)/carverauto-inbox"
-}
-
-fm_carverauto_inbox_backend() {
-  local configured
-  if [ -n "${FM_CARVERAUTO_INBOX_BACKEND:-}" ]; then
-    printf '%s' "$FM_CARVERAUTO_INBOX_BACKEND"
-    return 0
+  url=$(fm_carverauto_nats_url)
+  if [ -n "$url" ]; then
+    nats --server "$url" "$@"
+  else
+    nats "$@"
   fi
-  configured=$(fm_carverauto_config_read carverauto-inbox-backend)
-  if [ -n "$configured" ]; then
-    printf '%s' "$configured"
-    return 0
-  fi
-  if [ -n "$(fm_carverauto_nats_url)" ]; then
-    printf '%s' nats
-    return 0
-  fi
-  printf '%s' file
 }
 
 fm_carverauto_now() {
   date -u +'%Y-%m-%dT%H:%M:%SZ'
 }
 
-# Stream names are NATS-safe tokens. Refuse path separators so a stream never
-# escapes the overlay store into a task's on-disk inbox.
-fm_carverauto_valid_stream() {  # <name>
+# Stream, consumer, and task ids all become NATS subject or API tokens. Refuse
+# anything that is not a plain token so a caller cannot widen a subject or
+# reach outside the stream it named.
+fm_carverauto_valid_token() {  # <name>
   case "$1" in
     ''|*[!A-Za-z0-9._-]*|.*|*.|-*|*-) return 1 ;;
     *) return 0 ;;
@@ -165,7 +156,7 @@ fm_carverauto_require_https() {  # <url> <flag>
 # Returns 0 on a landed put, 1 when overlay is off or a put fails; the caller
 # must not treat a failure as an undelivered steer.
 fm_carverauto_inbox_dual_write() {  # <task-id> <disk-record>
-  local task_id=$1 record=$2 stream subject body rc=0
+  local task_id=$1 record=$2 stream body rc=0
   fm_carverauto_overlay_enabled || return 1
   stream=$(fm_carverauto_inbox_stream)
   if [ -z "$stream" ]; then
@@ -181,7 +172,6 @@ fm_carverauto_inbox_dual_write() {  # <task-id> <disk-record>
     return 1
   fi
   body=$(fm_task_inbox_body "$record") || return 1
-  subject="firstmate.steer.${task_id}"
   seq=$(basename "$record" .msg)
   seq=$((10#$seq))
   extra=()
@@ -190,7 +180,6 @@ fm_carverauto_inbox_dual_write() {  # <task-id> <disk-record>
   fi
   printf '%s' "$body" | "$_FM_CARVERAUTO_LIB_DIR/fm-steer.sh" put \
     --stream "$stream" \
-    --subject "$subject" \
     --task "$task_id" \
     --seq "$seq" \
     "${extra[@]+"${extra[@]}"}" \

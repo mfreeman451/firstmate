@@ -497,9 +497,8 @@ This overlay is not inherited by secondmate homes.
 Gitignored leaves, each overridable by the matching environment variable:
 
 - `config/carverauto-notify-py` / `FM_CARVERAUTO_NOTIFY_PY` - path to firstmate-notify's `notify.py` (default `~/src/firstmate-notify/notify.py`)
-- `config/carverauto-nats-url` / `FM_CARVERAUTO_NATS_URL` or `NATS_URL` - NATS server URL for the `nats` CLI
+- `config/carverauto-nats-url` / `FM_CARVERAUTO_NATS_URL` or `NATS_URL` - NATS server URL for the `nats` CLI; absent leaves the server to the `nats` CLI's own context
 - `config/carverauto-inbox-stream` / `FM_CARVERAUTO_INBOX_STREAM` - JetStream stream `fm-send` dual-writes to
-- `config/carverauto-inbox-backend` / `FM_CARVERAUTO_INBOX_BACKEND` - `file` or `nats` (file is the default without a NATS URL)
 - `config/carverauto-portal-url` / `FM_CARVERAUTO_PORTAL_URL` - fleet portal, default `https://firstmate.carverauto.dev`
 
 The Discord webhook stays in firstmate-notify's gitignored `.env` as `DISCORD_WEBHOOK_URL`.
@@ -507,8 +506,10 @@ NATS credentials stay in the `nats` CLI environment (`NATS_USER`, `NATS_PASSWORD
 Never commit those values.
 
 `bin/fm-steer.sh` is the OpenSpec CLI (`put`/`next`/`ack`/`list`, required `--stream`, subject `firstmate.steer.<task>`, payload `fm-task-inbox.v1`).
-It never deletes a task's on-disk inbox under `state/<id>.inbox/`.
-Dual-write is additive only.
+JetStream is its only store: it needs the `nats` CLI, and a steer is pending until the durable consumer acknowledges it.
+A portal assignment is a separate family on `firstmate.assign.<task>` with its own publisher.
+`bin/fm-steer.sh` never deletes a task's on-disk inbox under `state/<id>.inbox/`.
+Dual-write is additive only, and a dual-write that cannot reach NATS is a notice, never a failed steer.
 
 ## Relay (.env)
 
