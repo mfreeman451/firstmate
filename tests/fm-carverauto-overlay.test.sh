@@ -45,7 +45,8 @@ PY
 # can never pass against a CLI shape the real binary lacks.
 #   publish        stores subject+body under $NATS_STORE/msgs only for a -J
 #                  publish whose subject matches a prefix in $NATS_STORE/subjects
-#                  (the stream's subject set); a core publish is accepted and
+#                  ("<stream> <prefix>" per line); it reports the acknowledging
+#                  stream by name as natscli does. A core publish is accepted and
 #                  dropped, and a -J publish no stream captures fails as the
 #                  JetStream acknowledgement would. Like natscli it expands
 #                  {{Count}} in the body unless the publisher passed
@@ -55,6 +56,10 @@ PY
 #                  pending and first in line, --ack advances the ack floor
 #   consumer info  reports that consumer's delivered/ack_floor sequences and
 #                  its undelivered and delivered-unacked counts
+#                  NATS_FAKE_HANG=1 models a broker that accepts the connection
+#                  and never answers
+#   stream info    reports the stored sequence range
+#   stream get     returns one stored message, base64 body included
 make_nats_stub() {  # <dir>
   local fb="$1/fakebin"
   mkdir -p "$fb"
@@ -121,22 +126,52 @@ case "${args[0]:-}" in
     if [ "$js" = 0 ]; then
       exit 0
     fi
-    captured=0
+    if [ -n "${FM_SEND_LOG:-}" ] && [ -f "${FM_SEND_LOG}" ]; then
+      cp "$FM_SEND_LOG" "$store/send-log-at-publish"
+    fi
+    if [ "${NATS_FAKE_HANG:-0}" = 1 ]; then
+      /bin/sleep 30
+    fi
+    captured=
     if [ -f "$store/subjects" ]; then
-      while IFS= read -r prefix; do
+      while read -r sname prefix; do
         [ -n "$prefix" ] || continue
-        case "$subject" in "$prefix"*) captured=1 ;; esac
+        case "$subject" in "$prefix"*) captured=$sname ;; esac
       done <"$store/subjects"
     fi
-    if [ "$captured" = 0 ]; then
+    if [ -z "$captured" ]; then
       printf 'nats: error: nats: no responders available for request\n' >&2
       exit 1
     fi
     n=$(( $(stored) + 1 ))
     printf '%s' "$subject" >"$store/msgs/$(printf '%04d' "$n").subject"
     printf '%s' "$body" >"$store/msgs/$(printf '%04d' "$n").body"
-    printf 'Stored in Stream: fake Sequence: %s\n' "$n" >&2
+    printf 'Stored in Stream: %s Sequence: %s\n' "$captured" "$n" >&2
     exit 0 ;;
+  stream)
+    i=4
+    while [ "$i" -lt "${#args[@]}" ]; do
+      a=${args[$i]}
+      case "$a" in
+        --json|-j) : ;;
+        -*) reject "${a%%=*}" ;;
+      esac
+      i=$((i + 1))
+    done
+    case "${args[1]:-}" in
+      info)
+        printf '{"config":{"name":"%s"},"state":{"messages":%s,"first_seq":1,"last_seq":%s}}\n' \
+          "${args[2]:-}" "$(stored)" "$(stored)"
+        exit 0 ;;
+      get)
+        msg="$store/msgs/$(printf '%04d' "${args[3]:-0}")"
+        [ -f "$msg.body" ] \
+          || { printf 'nats: error: no message found\n' >&2; exit 1; }
+        printf '{"subject":"%s","seq":%s,"data":"%s","time":"2026-01-01T00:00:00Z"}\n' \
+          "$(cat "$msg.subject")" "${args[3]:-0}" "$(base64 <"$msg.body" | tr -d '\n')"
+        exit 0 ;;
+    esac
+    ;;
   consumer)
     case "${args[1]:-}" in
       next)
@@ -285,13 +320,14 @@ pending_count() {  # <dir> <stream>
   steer "$1" list --stream "$2" | awk -F'pending=' 'NF > 1 { print $2; exit }'
 }
 
-# The subject set of the stream the fake broker stands up: a JetStream publish
-# outside it is not stored, exactly as a real server refuses one no stream owns.
+# The streams the fake broker stands up, as "<stream> <subject prefix>": a
+# JetStream publish outside them is not stored, exactly as a real server refuses
+# one no stream owns, and the acknowledgement names the stream that stored it.
 setup_overlay_dir() {  # <name> -> echoes a dir with fakebin, home, and store
   local dir="$TMP_ROOT/$1"
   mkdir -p "$dir/home/state" "$dir/home/config" "$dir/nats/msgs"
   make_nats_stub "$dir"
-  printf 'firstmate.steer.\nfirstmate.assign.\n' >"$dir/nats/subjects"
+  printf 'firstmate firstmate.steer.\nfirstmate firstmate.assign.\n' >"$dir/nats/subjects"
   printf '%s\n' "$dir"
 }
 
@@ -338,6 +374,21 @@ test_put_sends_the_body_bytes_unchanged() {
   pass "fm-steer: put publishes the steer body byte for byte"
 }
 
+test_put_fails_when_another_stream_stored_the_steer() {
+  local dir err out rc
+  dir=$(setup_overlay_dir wrong-stream)
+  err="$dir/err"
+  printf 'FIRSTMATE firstmate.steer.\n' >"$dir/nats/subjects"
+  set +e
+  out=$(steer "$dir" put --stream firstmate --task t1 --seq 1 --body "please rebase" 2>"$err")
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "a steer stored by another stream must not report success"
+  assert_not_contains "$out" "put:" "no success line may claim a stream that did not store the steer"
+  assert_contains "$(cat "$err")" "firstmate" "the failure should name the stream that was asked for"
+  pass "fm-steer: put fails when the acknowledging stream is not --stream"
+}
+
 test_put_refuses_a_nats_cli_that_rewrites_bodies() {
   local dir err rc log
   dir=$(setup_overlay_dir old-natscli)
@@ -380,7 +431,7 @@ test_put_fails_when_no_stream_stored_the_steer() {
   local dir err rc
   dir=$(setup_overlay_dir no-stream)
   err="$dir/err"
-  printf 'firstmate.assign.\n' >"$dir/nats/subjects"
+  printf 'firstmate firstmate.assign.\n' >"$dir/nats/subjects"
   set +e
   steer "$dir" put --stream firstmate --task t1 --seq 1 --body "please rebase" \
     >/dev/null 2>"$err"
@@ -516,6 +567,29 @@ test_ack_refuses_another_sequence() {
   [ "$(pending_count "$dir" firstmate)" = 1 ] \
     || fail "a refused ack must leave the steer pending"
   pass "fm-steer: ack refuses a sequence next did not report"
+}
+
+test_list_enumerates_the_pending_steers() {
+  local dir listed seq
+  dir=$(setup_overlay_dir list-enumerate)
+  steer "$dir" put --stream firstmate --task t1 --seq 1 --body "first" >/dev/null
+  steer "$dir" put --stream firstmate --task t2 --seq 4 --body "second" >/dev/null
+  steer "$dir" put --stream firstmate --task t3 --seq 2 --body "third" >/dev/null
+  listed=$(steer "$dir" list --stream firstmate)
+  assert_contains "$listed" "pending=3" "list should still report the pending count"
+  assert_contains "$listed" "stream-seq=1 subject=firstmate.steer.t1 task=t1 seq=1" \
+    "list should name each pending steer by the sequence ack takes"
+  assert_contains "$listed" "stream-seq=2 subject=firstmate.steer.t2 task=t2 seq=4" \
+    "a steer behind the head must be listed without being delivered"
+  assert_contains "$listed" "stream-seq=3 subject=firstmate.steer.t3 task=t3 seq=2" \
+    "every pending steer should be listed"
+  seq=$(steer "$dir" next --stream firstmate | reported_stream_seq)
+  steer "$dir" ack --stream firstmate --stream-seq "$seq" >/dev/null
+  listed=$(steer "$dir" list --stream firstmate)
+  assert_contains "$listed" "pending=2" "the handled steer should leave the pending count"
+  assert_not_contains "$listed" "task=t1" "a handled steer must not be listed as pending"
+  assert_contains "$listed" "task=t2" "the remaining steers should still be listed"
+  pass "fm-steer: list enumerates the pending steers, not just how many"
 }
 
 test_inbox_does_not_touch_task_disk_inbox() {
@@ -660,6 +734,8 @@ run_send() {
     FM_ROOT_OVERRIDE="$dir/home" FM_HOME="$dir/home" FM_SEND_LOG="$dir/send.log" \
     FM_SEND_SETTLE=0 NATS_STORE="$dir/nats" \
     FM_CARVERAUTO_NATS_URL=nats://127.0.0.1:4222 \
+    NATS_FAKE_HANG="${NATS_FAKE_HANG:-0}" \
+    FM_CARVERAUTO_DUAL_WRITE_BUDGET_SECS="${FM_CARVERAUTO_DUAL_WRITE_BUDGET_SECS:-10}" \
     "$SEND" "$@"
 }
 
@@ -685,6 +761,40 @@ test_send_dual_write_keeps_disk_inbox() {
   pass "fm-send: overlay dual-write is additive and keeps the on-disk inbox"
 }
 
+test_send_rings_the_doorbell_before_the_dual_write() {
+  local dir
+  dir=$(setup_overlay_dir send-order)
+  make_tmux_stubs "$dir"
+  fm_write_meta "$dir/home/state/t1.meta" "window=sess:fm-t1" "kind=ship" "harness=claude"
+  printf 'on\n' >"$dir/home/config/carverauto-overlay"
+  printf 'firstmate\n' >"$dir/home/config/carverauto-inbox-stream"
+  : >"$dir/send.log"
+  run_send "$dir" t1 "please rebase onto main" >/dev/null
+  [ "$(published_count "$dir")" = 1 ] || fail "the steer should have been dual-written"
+  [ -s "$dir/nats/send-log-at-publish" ] \
+    || fail "the doorbell must already have rung when the overlay reached NATS"
+  pass "fm-send: the doorbell rings before the overlay waits on NATS"
+}
+
+test_send_dual_write_is_bounded() {
+  local dir err
+  dir=$(setup_overlay_dir send-hang)
+  make_tmux_stubs "$dir"
+  fm_write_meta "$dir/home/state/t1.meta" "window=sess:fm-t1" "kind=ship" "harness=claude"
+  printf 'on\n' >"$dir/home/config/carverauto-overlay"
+  printf 'firstmate\n' >"$dir/home/config/carverauto-inbox-stream"
+  : >"$dir/send.log"
+  err="$dir/err"
+  NATS_FAKE_HANG=1 FM_CARVERAUTO_DUAL_WRITE_BUDGET_SECS=1 \
+    run_send "$dir" t1 "please rebase onto main" >/dev/null 2>"$err" \
+    || fail "a broker that never answers must not fail the steer"
+  [ -f "$dir/home/state/t1.inbox/001.msg" ] || fail "the on-disk record must still be written"
+  [ -s "$dir/send.log" ] || fail "the doorbell must have rung despite the hung broker"
+  [ "$(published_count "$dir")" = 0 ] || fail "a bounded dual-write stored nothing"
+  assert_contains "$(cat "$err")" "bound" "fm-send should say the dual-write hit its bound"
+  pass "fm-send: a broker that never answers cannot hold a steer open"
+}
+
 test_send_dual_write_reports_a_steer_that_did_not_land() {
   local dir rec err
   dir=$(setup_overlay_dir send-nostream)
@@ -692,7 +802,7 @@ test_send_dual_write_reports_a_steer_that_did_not_land() {
   fm_write_meta "$dir/home/state/t1.meta" "window=sess:fm-t1" "kind=ship" "harness=claude"
   printf 'on\n' >"$dir/home/config/carverauto-overlay"
   printf 'firstmate\n' >"$dir/home/config/carverauto-inbox-stream"
-  printf 'firstmate.assign.\n' >"$dir/nats/subjects"
+  printf 'firstmate firstmate.assign.\n' >"$dir/nats/subjects"
   : >"$dir/send.log"
   err="$dir/err"
   run_send "$dir" t1 "please rebase onto main" >/dev/null 2>"$err" \
@@ -705,7 +815,7 @@ test_send_dual_write_reports_a_steer_that_did_not_land() {
   pass "fm-send: a steer no stream stored is reported, never counted as landed"
 }
 
-test_send_idempotent_resend_publishes_once() {
+test_send_idempotent_resend_republishes_the_mirror() {
   local dir delivery
   dir=$(setup_overlay_dir send-idempotent)
   make_tmux_stubs "$dir"
@@ -720,9 +830,9 @@ test_send_idempotent_resend_publishes_once() {
     || fail "the fire-and-forget retry failed"
   [ "$(ls -1 "$dir/home/state/s1.inbox"/*.msg | wc -l | tr -d ' ')" = 1 ] \
     || fail "the retry duplicated the on-disk record"
-  [ "$(published_count "$dir")" = 1 ] \
-    || fail "the retry duplicated the JetStream copy of a deduplicated steer"
-  pass "fm-send: a deduplicated resend does not publish a second steer"
+  [ "$(published_count "$dir")" = 2 ] \
+    || fail "the retry must republish the mirror rather than silently skip it"
+  pass "fm-send: a deduplicated resend still republishes the JetStream mirror"
 }
 
 test_send_without_overlay_skips_dual_write() {
@@ -741,6 +851,7 @@ test_stream_required
 test_put_publishes_the_full_envelope
 test_put_sends_the_body_bytes_unchanged
 test_put_fails_when_no_stream_stored_the_steer
+test_put_fails_when_another_stream_stored_the_steer
 test_put_refuses_a_nats_cli_that_rewrites_bodies
 test_nats_url_must_not_carry_credentials
 test_nats_url_env_is_left_to_the_nats_cli
@@ -750,6 +861,7 @@ test_steer_has_no_contract_escape_hatches
 test_next_peeks_and_ack_handles_that_steer
 test_repeated_ack_never_handles_an_unread_steer
 test_ack_refuses_another_sequence
+test_list_enumerates_the_pending_steers
 test_inbox_does_not_touch_task_disk_inbox
 test_notify_captain_needed_includes_portal_and_hides_token
 test_notify_portal_url_cannot_be_suppressed
@@ -758,6 +870,8 @@ test_notify_archify_requires_a_diagram
 test_portal_assign_publishes_its_own_family
 test_portal_rejects_non_https
 test_send_dual_write_keeps_disk_inbox
+test_send_rings_the_doorbell_before_the_dual_write
+test_send_dual_write_is_bounded
 test_send_dual_write_reports_a_steer_that_did_not_land
-test_send_idempotent_resend_publishes_once
+test_send_idempotent_resend_republishes_the_mirror
 test_send_without_overlay_skips_dual_write

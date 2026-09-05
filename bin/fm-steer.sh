@@ -151,7 +151,7 @@ print(int(d.get("num_pending", 0)),
 }
 
 cmd_put() {
-  local body payload
+  local body payload ack
   [ -n "$TASK_ID" ] || die "put requires --task (the subject is firstmate.steer.<task>)"
   fm_carverauto_valid_token "$TASK_ID" || die "invalid --task (use a NATS-safe token, no path separators)"
   [ -n "$SEQ_ARG" ] || die "put requires --seq (the fm-task-inbox.v1 record sequence)"
@@ -164,8 +164,17 @@ cmd_put() {
     payload="${payload}delivery=fire-and-forget"$'\n'
   fi
   payload="${payload}--"$'\n'"$body"
-  fm_carverauto_nats_publish "firstmate.steer.${TASK_ID}" "$payload" >&2 \
-    || fail "nats publish to firstmate.steer.${TASK_ID} failed"
+  ack=$(fm_carverauto_nats_publish "firstmate.steer.${TASK_ID}" "$payload" 2>&1) || {
+    [ -z "$ack" ] || printf '%s\n' "$ack" >&2
+    fail "nats publish to firstmate.steer.${TASK_ID} failed"
+  }
+  case "$ack" in
+    *"Stored in Stream: $STREAM Sequence:"*) ;;
+    *)
+      [ -z "$ack" ] || printf '%s\n' "$ack" >&2
+      fail "firstmate.steer.${TASK_ID} was not stored in stream $STREAM; the JetStream acknowledgement names a different stream, so --stream and the stream capturing that subject disagree"
+      ;;
+  esac
   printf 'put: stream=%s subject=firstmate.steer.%s seq=%s\n' "$STREAM" "$TASK_ID" "$SEQ_ARG"
 }
 
@@ -199,14 +208,55 @@ cmd_ack() {
   printf 'ack: stream=%s stream-seq=%s handled\n' "$STREAM" "$STREAM_SEQ"
 }
 
+# The stream's highest sequence, which bounds the walk over pending steers.
+stream_last_seq() {
+  local info
+  info=$(fm_carverauto_nats_run stream info "$STREAM" --json) \
+    || fail "nats stream info failed for stream $STREAM"
+  printf '%s' "$info" | python3 -c 'import json, sys
+print(int(json.load(sys.stdin).get("state", {}).get("last_seq", 0)))' \
+    || fail "nats stream info did not describe stream $STREAM"
+}
+
+# One stored steer, as "subject=<s> task=<t> seq=<n>". Reading the stream does
+# not touch the durable consumer, so listing never handles or redelivers a steer.
+stream_message() {  # <stream-seq>
+  local raw
+  raw=$(fm_carverauto_nats_run stream get "$STREAM" "$1" --json 2>/dev/null) || return 1
+  printf '%s' "$raw" | python3 -c 'import base64, json, sys
+m = json.load(sys.stdin)
+fields = {}
+for line in base64.b64decode(m.get("data", "")).decode("utf-8", "replace").split("\n"):
+    if line == "--":
+        break
+    key, _, value = line.partition("=")
+    fields[key] = value
+print("subject=%s task=%s seq=%s"
+      % (m.get("subject", ""), fields.get("task", ""), fields.get("seq", "")))' \
+    || return 1
+}
+
 # Pending is everything the durable consumer has not acknowledged - both what
 # it has never delivered and what it has delivered without an ack - never the
-# stream's retained history.
+# stream's retained history. Each pending steer is listed by the same
+# stream-seq that ack takes, walking the stream above the consumer's ack floor.
 cmd_list() {
-  local state pending ackpending
+  local state pending ackpending floor total last seq shown line
   state=$(consumer_state)
-  read -r pending ackpending _ _ <<<"$state"
-  printf 'stream=%s pending=%s\n' "$STREAM" "$((pending + ackpending))"
+  read -r pending ackpending _ floor <<<"$state"
+  total=$((pending + ackpending))
+  printf 'stream=%s pending=%s\n' "$STREAM" "$total"
+  [ "$total" -gt 0 ] || return 0
+  last=$(stream_last_seq)
+  shown=0
+  seq=$((floor + 1))
+  while [ "$shown" -lt "$total" ] && [ "$seq" -le "$last" ]; do
+    if line=$(stream_message "$seq"); then
+      printf 'stream-seq=%s %s\n' "$seq" "$line"
+      shown=$((shown + 1))
+    fi
+    seq=$((seq + 1))
+  done
 }
 
 case "$CMD" in

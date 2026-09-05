@@ -507,11 +507,12 @@ Never commit those values.
 
 `bin/fm-steer.sh` is the OpenSpec CLI (`put`/`next`/`ack`/`list`, required `--stream`, subject `firstmate.steer.<task>`, payload `fm-task-inbox.v1`).
 JetStream is its only store: it needs natscli 0.4.0 or newer, whose `--templates=false` keeps a steer body byte for byte (older ones expand `{{...}}` in it and are refused), and a steer stays pending until `ack --stream-seq` acknowledges the exact steer `next` reported.
-`put` publishes to JetStream and fails when no stream stored the steer, so the stream capturing `firstmate.steer.>` must exist first.
+`put` publishes to JetStream and fails when no stream stored the steer, or when the stream that acknowledged it is not the one `--stream` named, so the stream capturing `firstmate.steer.>` must exist first and its name must match (NATS stream names are case-sensitive).
 `next`, `ack`, and `list` address a durable pull consumer named after the stream, with `AckPolicy=explicit`; create it with `nats consumer add` before using them, because the overlay never provisions it.
 A portal assignment is a separate family on `firstmate.assign.<task>` with its own publisher.
 `bin/fm-steer.sh` never deletes a task's on-disk inbox under `state/<id>.inbox/`.
-Dual-write is additive only, and a dual-write that cannot reach NATS is a notice, never a failed steer.
+Dual-write is additive only: it runs after the doorbell rings, is bounded so an unreachable broker cannot delay a steer, and a dual-write that cannot reach NATS is a notice, never a failed steer.
+A re-run that deduplicates onto an existing on-disk record publishes again, so the JetStream mirror is at-least-once.
 
 ## Relay (.env)
 

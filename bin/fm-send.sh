@@ -49,7 +49,8 @@
 # bin/fm-task-inbox-lib.sh owns the record format, the doorbell line, and the
 # re-ring ladder.
 # On this Carverauto fork, an enabled overlay may dual-write the same body
-# through bin/fm-steer.sh after that on-disk enqueue; the disk inbox is
+# through bin/fm-steer.sh after that on-disk enqueue and after the doorbell
+# has rung, bounded so a sick broker never delays the ring; the disk inbox is
 # never skipped or deleted (carverauto-overlay skill).
 # The composer pre-check before the ring is ADVISORY only: when
 # the composer visibly holds pending text the ring is skipped with a notice and
@@ -962,18 +963,9 @@ else
       echo "error: steer not sent to $INBOX_TASK_ID: the task retired or changed endpoint during target resolution" >&2
       exit 1
     fi
-    INBOX_RECORD_REUSED=0
     if [ "${FM_SEND_IDEMPOTENT:-0}" = 1 ]; then
-      # Which records existed before the deduplicating write, so the caller can
-      # tell a fresh enqueue from a re-run that landed on an existing record.
-      INBOX_RECORDS_BEFORE=$(cd "$(fm_task_inbox_dir "$STATE" "$INBOX_TASK_ID")" 2>/dev/null \
-        && ls -1 ./*.msg ./handled/*.msg 2>/dev/null | sed 's|.*/||' || true)
       INBOX_RECORD=$(fm_task_inbox_write_idempotent "$STATE" "$INBOX_TASK_ID" "$MESSAGE" \
         "${FIRE_AND_FORGET_ID:+fire-and-forget}") || inbox_write_rc=$?
-      if [ "${inbox_write_rc:-0}" -eq 0 ] \
-        && printf '%s\n' "$INBOX_RECORDS_BEFORE" | grep -qxF "${INBOX_RECORD##*/}"; then
-        INBOX_RECORD_REUSED=1
-      fi
     else
       INBOX_RECORD=$(fm_task_inbox_write "$STATE" "$INBOX_TASK_ID" "$MESSAGE" \
         "${FIRE_AND_FORGET_ID:+fire-and-forget}") || inbox_write_rc=$?
@@ -987,12 +979,6 @@ else
       exit 1
     fi
     fm_lock_release "$INBOX_META_LOCK"
-    # Additive overlay only: a failed or skipped JetStream put never undoes
-    # the on-disk record and never fails this send. A reused record is the
-    # same steer the overlay already published, so it is not published again.
-    if [ "$INBOX_RECORD_REUSED" = 0 ]; then
-      fm_carverauto_inbox_dual_write "$INBOX_TASK_ID" "$INBOX_RECORD" || true
-    fi
     # Enqueue IS durable delivery to the task's record: mark the pending
     # expectation delivered now, without resolving it - only a correlated
     # parent report acknowledges the request.
@@ -1030,6 +1016,11 @@ else
       1) echo "fm-send: doorbell skipped (composer visibly holds pending text); the steer is durably recorded at $INBOX_RECORD and the watcher will re-ring" >&2 ;;
       2) echo "fm-send: doorbell did not reach $T; the steer is durably recorded at $INBOX_RECORD and the watcher will re-ring" >&2 ;;
     esac
+    # Additive overlay only, and last: a failed JetStream put never undoes the
+    # on-disk record, never fails this send, and never delays the doorbell. A
+    # re-run that landed on an existing record publishes again, so the mirror
+    # is at-least-once rather than silently missing.
+    fm_carverauto_inbox_dual_write "$INBOX_TASK_ID" "$INBOX_RECORD" || true
     exit 0
   fi
   # Slash commands open a completion popup in some TUIs (verified on codex);

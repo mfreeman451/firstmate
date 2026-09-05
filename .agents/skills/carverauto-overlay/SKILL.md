@@ -59,8 +59,10 @@ bin/fm-steer.sh list --stream <name>
 
 `next` peeks the durable consumer and leaves the steer pending, reporting the `stream-seq` that identifies it.
 `ack` takes that same `--stream-seq` and is what marks that steer handled; it refuses any other sequence rather than handling a steer nobody read.
+`list` reports the pending count and then one line per pending steer - `stream-seq`, subject, task, and record seq - without delivering any of them.
 
-`fm-send` dual-writes onto this CLI after a successful on-disk enqueue when the overlay is on and a stream is configured.
+`fm-send` dual-writes onto this CLI after a successful on-disk enqueue and after the doorbell rings, when the overlay is on and a stream is configured.
+A re-run that deduplicates onto an existing record publishes again, so the JetStream mirror is at-least-once rather than silently missing.
 The on-disk inbox under `state/<id>.inbox/` remains the delivery record.
 Do not delete those files.
 This CLI has no path that removes a task inbox.

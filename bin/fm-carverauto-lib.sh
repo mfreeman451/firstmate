@@ -15,6 +15,13 @@
 
 _FM_CARVERAUTO_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 _FM_CARVERAUTO_ROOT="$(cd "$_FM_CARVERAUTO_LIB_DIR/.." && pwd)"
+# shellcheck source=bin/fm-timeout-lib.sh
+. "$_FM_CARVERAUTO_LIB_DIR/fm-timeout-lib.sh"
+
+# A dual-write must never hold a steer's doorbell open: a NATS host that
+# blackholes rather than refuses would otherwise cost natscli's connect and
+# response budget on every send.
+FM_CARVERAUTO_DUAL_WRITE_BUDGET_SECS=${FM_CARVERAUTO_DUAL_WRITE_BUDGET_SECS:-10}
 
 FM_CARVERAUTO_PORTAL_DEFAULT='https://firstmate.carverauto.dev'
 FM_CARVERAUTO_NOTIFY_PY_DEFAULT="$HOME/src/firstmate-notify/notify.py"
@@ -177,9 +184,10 @@ fm_carverauto_require_https() {  # <url> <flag>
   esac
 }
 
-# Additive dual-write used by fm-send after a successful on-disk enqueue.
-# Reads the body from the disk record so the JetStream copy cannot diverge.
-# Never unlinks, moves, or truncates the on-disk inbox record.
+# Additive dual-write used by fm-send after a successful on-disk enqueue and
+# after the doorbell has rung. Reads the body from the disk record so the
+# JetStream copy cannot diverge, and is bounded so a sick broker cannot hold
+# the send open. Never unlinks, moves, or truncates the on-disk inbox record.
 # Returns 0 on a landed put, 1 when overlay is off or a put fails; the caller
 # must not treat a failure as an undelivered steer.
 fm_carverauto_inbox_dual_write() {  # <task-id> <disk-record>
@@ -205,13 +213,19 @@ fm_carverauto_inbox_dual_write() {  # <task-id> <disk-record>
   if grep -q '^delivery=fire-and-forget$' "$record" 2>/dev/null; then
     extra+=(--delivery fire-and-forget)
   fi
-  printf '%s' "$body" | "$_FM_CARVERAUTO_LIB_DIR/fm-steer.sh" put \
+  fm_run_timed "$FM_CARVERAUTO_DUAL_WRITE_BUDGET_SECS" \
+    "$_FM_CARVERAUTO_LIB_DIR/fm-steer.sh" put \
     --stream "$stream" \
     --task "$task_id" \
     --seq "$seq" \
+    --body "$body" \
     "${extra[@]+"${extra[@]}"}" \
     >&2 \
     || rc=$?
+  if [ "$rc" = 124 ]; then
+    echo "notice: Carverauto JetStream dual-write hit its ${FM_CARVERAUTO_DUAL_WRITE_BUDGET_SECS}s bound; on-disk inbox remains at $record" >&2
+    return 1
+  fi
   if [ "$rc" -ne 0 ]; then
     echo "notice: Carverauto JetStream dual-write did not land; on-disk inbox remains at $record" >&2
     return 1
