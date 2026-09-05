@@ -38,10 +38,13 @@ PY
   chmod +x "$dir/notify.py"
 }
 
-# A fake NATS server for the subset of the CLI the overlay uses.
+# A fake NATS server for the subset of the CLI the overlay uses. It rejects any
+# flag the modelled binary does not implement, exactly as fisk does, so a test
+# can never pass against a CLI shape the real binary lacks.
 #   publish        stores subject+body under $NATS_STORE/msgs, and - like
 #                  natscli - expands {{Count}} in the body unless the publisher
-#                  passed --templates=false
+#                  passed --templates=false; NATS_FAKE_TEMPLATES=0 models a
+#                  natscli older than 0.4.0, which has no such flag at all
 #   consumer next  serves the head of the one durable consumer: --nak leaves it
 #                  pending and first in line, --ack advances the ack floor
 #   consumer info  reports that consumer's delivered/ack_floor sequences and
@@ -54,6 +57,13 @@ make_nats_stub() {  # <dir>
 set -u
 store=${NATS_STORE:?NATS_STORE is required}
 mkdir -p "$store/msgs"
+templates=${NATS_FAKE_TEMPLATES:-1}
+
+reject() {  # <flag>
+  printf "error: unknown long flag '%s'\n" "$1" >&2
+  exit 1
+}
+
 args=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -66,19 +76,36 @@ done
 printf 'argv=%s\n' "$(printf '%s ' "${args[@]+"${args[@]}"}")" >>"$store/argv.log"
 stored() { ls -1 "$store/msgs"/*.body 2>/dev/null | wc -l | tr -d ' '; }
 state_get() { cat "$store/$1" 2>/dev/null || printf '0'; }
+
 case "${args[0]:-}" in
   publish)
-    templates=1
+    expand=1
     rest=()
-    for a in "${args[@]:1}"; do
+    i=1
+    while [ "$i" -lt "${#args[@]}" ]; do
+      a=${args[$i]}
       case "$a" in
-        --templates=false) templates=0 ;;
-        --) ;;
+        --help)
+          printf 'usage: nats publish [<flags>] <subject> [<body>]\n\nFlags:\n'
+          printf '      --reply=REPLY        Sets a custom reply to subject\n'
+          printf '  -H, --header=HEADER ...  Adds headers to the message\n'
+          printf '      --count=1            Publish multiple messages\n'
+          printf '      --force-stdin        Force reading from stdin\n'
+          if [ "$templates" = 1 ]; then
+            printf '      --[no-]templates     Enables template functions in the body and subject\n'
+          fi
+          exit 0 ;;
+        --templates=false)
+          [ "$templates" = 1 ] || reject --templates
+          expand=0 ;;
+        --) : ;;
+        -*) reject "${a%%=*}" ;;
         *) rest+=("$a") ;;
       esac
+      i=$((i + 1))
     done
     body=${rest[1]:-}
-    if [ "$templates" = 1 ]; then
+    if [ "$expand" = 1 ]; then
       body=${body//\{\{Count\}\}/1}
     fi
     n=$(( $(stored) + 1 ))
@@ -90,11 +117,18 @@ case "${args[0]:-}" in
       next)
         ack=0
         nak=0
-        for a in "${args[@]}"; do
+        i=4
+        while [ "$i" -lt "${#args[@]}" ]; do
+          a=${args[$i]}
           case "$a" in
+            --count) i=$((i + 2)); continue ;;
             --ack) ack=1 ;;
+            --no-ack) ack=0 ;;
             --nak) nak=1 ;;
+            --raw|-r) : ;;
+            -*) reject "${a%%=*}" ;;
           esac
+          i=$((i + 1))
         done
         head=$(state_get nak)
         if [ "$head" = 0 ]; then
@@ -115,6 +149,15 @@ case "${args[0]:-}" in
         fi
         exit 0 ;;
       info)
+        i=4
+        while [ "$i" -lt "${#args[@]}" ]; do
+          a=${args[$i]}
+          case "$a" in
+            --json|-j) : ;;
+            -*) reject "${a%%=*}" ;;
+          esac
+          i=$((i + 1))
+        done
         ackpending=0
         [ "$(state_get nak)" = 0 ] || ackpending=1
         printf '{"stream_name":"%s","name":"%s","delivered":{"consumer_seq":%s,"stream_seq":%s},' \
@@ -174,14 +217,18 @@ SH
 steer() {
   local dir=$1; shift
   env PATH="$dir/fakebin:$PATH" FM_HOME="$dir/home" \
-    NATS_STORE="$dir/nats" FM_CARVERAUTO_NATS_URL=nats://127.0.0.1:4222 \
+    NATS_STORE="$dir/nats" \
+    FM_CARVERAUTO_NATS_URL="${FM_CARVERAUTO_NATS_URL:-nats://127.0.0.1:4222}" \
+    NATS_FAKE_TEMPLATES="${NATS_FAKE_TEMPLATES:-1}" \
     "$STEER" "$@"
 }
 
 portal() {  # <dir> <fm-carverauto-portal args...>
   local dir=$1; shift
   env PATH="$dir/fakebin:$PATH" FM_HOME="$dir/home" \
-    NATS_STORE="$dir/nats" FM_CARVERAUTO_NATS_URL=nats://127.0.0.1:4222 \
+    NATS_STORE="$dir/nats" \
+    FM_CARVERAUTO_NATS_URL="${FM_CARVERAUTO_NATS_URL:-nats://127.0.0.1:4222}" \
+    NATS_FAKE_TEMPLATES="${NATS_FAKE_TEMPLATES:-1}" \
     "$PORTAL" "$@"
 }
 
@@ -261,6 +308,44 @@ test_put_sends_the_body_bytes_unchanged() {
   [ "$(printf '%s\n' "$msg" | after_separator)" = "$body" ] \
     || fail "the steer body was rewritten in flight: $msg"
   pass "fm-steer: put publishes the steer body byte for byte"
+}
+
+test_put_refuses_a_nats_cli_that_rewrites_bodies() {
+  local dir err rc log
+  dir=$(setup_overlay_dir old-natscli)
+  err="$dir/err"
+  set +e
+  NATS_FAKE_TEMPLATES=0 steer "$dir" put --stream firstmate --task t1 --seq 1 \
+    --body 'ship {{Count}} now' >/dev/null 2>"$err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "a nats CLI that rewrites a body must not be published through"
+  assert_contains "$(cat "$err")" "natscli 0.4.0" "the refusal should name the CLI the overlay needs"
+  [ "$(published_count "$dir")" = 0 ] \
+    || fail "nothing may be published through a CLI that rewrites bodies"
+  log=$(cat "$dir/nats/argv.log" 2>/dev/null || printf '')
+  assert_not_contains "$log" "--templates=false" \
+    "the preflight must refuse before handing the CLI a flag it does not have"
+  pass "fm-steer: put refuses a nats CLI that would expand a steer body"
+}
+
+test_nats_url_must_not_carry_credentials() {
+  local dir err rc log
+  dir=$(setup_overlay_dir nats-userinfo)
+  err="$dir/err"
+  set +e
+  FM_CARVERAUTO_NATS_URL='nats://fm:s3cret@nats.carverauto.dev:4222' \
+    steer "$dir" put --stream firstmate --task t1 --seq 1 --body "please rebase" \
+    >/dev/null 2>"$err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "a NATS URL carrying a password must not be used"
+  assert_contains "$(cat "$err")" "NATS_CREDS" \
+    "the refusal should point at the credential environment"
+  [ "$(published_count "$dir")" = 0 ] || fail "a refused URL must publish nothing"
+  log=$(cat "$dir/nats/argv.log" 2>/dev/null || printf '')
+  assert_not_contains "$log" "s3cret" "the password must never reach the nats CLI argv"
+  pass "fm-steer: a NATS URL that embeds credentials never reaches argv"
 }
 
 test_put_marks_fire_and_forget() {
@@ -576,6 +661,8 @@ test_send_without_overlay_skips_dual_write() {
 test_stream_required
 test_put_publishes_the_full_envelope
 test_put_sends_the_body_bytes_unchanged
+test_put_refuses_a_nats_cli_that_rewrites_bodies
+test_nats_url_must_not_carry_credentials
 test_put_marks_fire_and_forget
 test_put_requires_the_contract_fields
 test_steer_has_no_contract_escape_hatches

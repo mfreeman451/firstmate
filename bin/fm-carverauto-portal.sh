@@ -14,8 +14,7 @@
 # bin/fm-steer.sh, whose subject and schema are pinned to the steering-inbox
 # contract. Nothing on this path touches the on-disk steering inbox.
 #
-# The payload is published byte for byte, which needs a nats CLI new enough
-# for --templates.
+# The payload is published byte for byte, which needs natscli 0.4.0 or newer.
 #
 # Default portal_url: https://firstmate.carverauto.dev
 # bin/fm-carverauto-lib.sh owns overlay opt-in, URL resolution, and the nats
@@ -122,6 +121,6 @@ PY
 )
 
 SUBJECT="firstmate.assign.${TASK_ID}"
-fm_carverauto_nats_run publish --templates=false "$SUBJECT" -- "$PAYLOAD" >&2 \
-  || { printf 'error: nats publish to %s failed (the overlay needs a nats CLI that supports --templates)\n' "$SUBJECT" >&2; exit 1; }
+fm_carverauto_nats_publish "$SUBJECT" "$PAYLOAD" >&2 \
+  || { printf 'error: nats publish to %s failed\n' "$SUBJECT" >&2; exit 1; }
 printf 'assign: subject=%s task=%s worker=%s\n' "$SUBJECT" "$TASK_ID" "$WORKER"

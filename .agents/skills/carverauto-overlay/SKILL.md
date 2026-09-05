@@ -65,7 +65,8 @@ The on-disk inbox under `state/<id>.inbox/` remains the delivery record.
 Do not delete those files.
 This CLI has no path that removes a task inbox.
 
-JetStream is the only store: the `nats` CLI must be on PATH and new enough to support `--templates` (older ones expand `{{...}}` in a steer body), and NATS credentials stay in its environment.
+JetStream is the only store: the `nats` CLI must be on PATH and be natscli 0.4.0 or newer (older ones expand `{{...}}` in a steer body and are refused).
+NATS credentials stay in that CLI's environment (`NATS_USER`, `NATS_PASSWORD`, `NATS_CREDS`); a server URL that embeds them is refused, because the URL rides argv.
 A dual-write that cannot reach NATS prints a notice; the on-disk record is still the delivered steer.
 
 ## Portal assignment

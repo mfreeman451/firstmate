@@ -108,8 +108,9 @@ fm_carverauto_inbox_stream() {
 }
 
 # ONE owner of the nats CLI invocation. Only the configured server URL rides
-# argv; credentials stay in the CLI's own environment (NATS_USER,
-# NATS_PASSWORD, NATS_CREDS) so they never reach a process listing or a log.
+# argv, and a URL carrying userinfo is refused outright, so credentials stay in
+# the CLI's own environment (NATS_USER, NATS_PASSWORD, NATS_CREDS) and never
+# reach a process listing or a log.
 fm_carverauto_nats_run() {  # <nats-args...>
   local url
   if ! command -v nats >/dev/null 2>&1; then
@@ -117,11 +118,35 @@ fm_carverauto_nats_run() {  # <nats-args...>
     return 127
   fi
   url=$(fm_carverauto_nats_url)
+  case "$url" in
+    *@*)
+      echo "error: the Carverauto NATS URL must not embed credentials; drop the userinfo from the URL and put the secret in NATS_USER, NATS_PASSWORD, or NATS_CREDS so it never reaches argv" >&2
+      return 2
+      ;;
+  esac
   if [ -n "$url" ]; then
     nats --server "$url" "$@"
   else
     nats "$@"
   fi
+}
+
+# ONE owner of publishing a payload. natscli expands Go templates ({{Count}},
+# {{ID}}, {{Time}}, ...) in a publish body unless --templates=false is passed,
+# and that flag exists only from natscli 0.4.0. A CLI without it cannot carry a
+# body byte for byte, so the overlay refuses up front instead of publishing a
+# message that differs from what the caller handed it.
+fm_carverauto_nats_publish() {  # <subject> <payload>
+  local help
+  help=$(fm_carverauto_nats_run publish --help) || return 1
+  case "$help" in
+    *'--[no-]templates'*|*--templates*) ;;
+    *)
+      echo "error: this nats CLI expands Go templates in a published body and cannot be told not to; the Carverauto overlay needs natscli 0.4.0 or newer, which accepts --templates=false" >&2
+      return 1
+      ;;
+  esac
+  fm_carverauto_nats_run publish --templates=false "$1" -- "$2"
 }
 
 fm_carverauto_now() {

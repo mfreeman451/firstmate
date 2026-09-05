@@ -20,9 +20,9 @@
 # publisher (bin/fm-carverauto-portal.sh), not an override here.
 #
 # JetStream is the only store. put publishes the envelope with the body bytes
-# unchanged, which needs a nats CLI new enough for --templates: older ones
-# expand Go templates such as {{Count}} in the body and would publish a steer
-# that differs from the on-disk record.
+# unchanged, which needs natscli 0.4.0 or newer: older ones expand Go templates
+# such as {{Count}} in the body, so bin/fm-carverauto-lib.sh refuses to publish
+# through them rather than send a steer that differs from the on-disk record.
 #
 # next peeks the head of the durable consumer: the steer is delivered and
 # negative-acknowledged, so it stays pending and stays first in line, and next
@@ -157,8 +157,8 @@ cmd_put() {
     payload="${payload}delivery=fire-and-forget"$'\n'
   fi
   payload="${payload}--"$'\n'"$body"
-  fm_carverauto_nats_run publish --templates=false "firstmate.steer.${TASK_ID}" -- "$payload" >&2 \
-    || fail "nats publish to firstmate.steer.${TASK_ID} failed (the overlay needs a nats CLI that supports --templates, so a steer body is published byte for byte)"
+  fm_carverauto_nats_publish "firstmate.steer.${TASK_ID}" "$payload" >&2 \
+    || fail "nats publish to firstmate.steer.${TASK_ID} failed"
   printf 'put: stream=%s subject=firstmate.steer.%s seq=%s\n' "$STREAM" "$TASK_ID" "$SEQ_ARG"
 }
 
