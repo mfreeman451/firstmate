@@ -53,18 +53,19 @@ Do not invent a different subject or schema.
 ```sh
 printf '%s' "$body" | bin/fm-steer.sh put --stream <name> --task <id> --seq <n>
 bin/fm-steer.sh next --stream <name>
-bin/fm-steer.sh ack --stream <name>
+bin/fm-steer.sh ack --stream <name> --stream-seq <n>
 bin/fm-steer.sh list --stream <name>
 ```
 
-`next` peeks the durable consumer and leaves the steer pending; `ack` is what marks it handled.
+`next` peeks the durable consumer and leaves the steer pending, reporting the `stream-seq` that identifies it.
+`ack` takes that same `--stream-seq` and is what marks that steer handled; it refuses any other sequence rather than handling a steer nobody read.
 
 `fm-send` dual-writes onto this CLI after a successful on-disk enqueue when the overlay is on and a stream is configured.
 The on-disk inbox under `state/<id>.inbox/` remains the delivery record.
 Do not delete those files.
 This CLI has no path that removes a task inbox.
 
-JetStream is the only store: the `nats` CLI must be on PATH, and NATS credentials stay in its environment.
+JetStream is the only store: the `nats` CLI must be on PATH and new enough to support `--templates` (older ones expand `{{...}}` in a steer body), and NATS credentials stay in its environment.
 A dual-write that cannot reach NATS prints a notice; the on-disk record is still the delivered steer.
 
 ## Portal assignment
@@ -72,7 +73,7 @@ A dual-write that cannot reach NATS prints a notice; the on-disk record is still
 When a worker is assigned, or a PR or issue URL or BuildBuddy check URL is known, publish the assignment for `https://firstmate.carverauto.dev`:
 
 ```sh
-bin/fm-carverauto-portal.sh assign --stream <name> --task-id <id> --worker <name> \
+bin/fm-carverauto-portal.sh assign --task-id <id> --worker <name> \
   --pr-url https://... --issue-url https://... --buildbuddy-url https://...
 ```
 

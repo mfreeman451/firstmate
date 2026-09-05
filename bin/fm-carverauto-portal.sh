@@ -2,17 +2,20 @@
 # Publish a fleet-portal assignment onto JetStream for firstmate.carverauto.dev.
 #
 # Usage:
-#   fm-carverauto-portal.sh assign --stream <name> --task-id <id> --worker <name> \
+#   fm-carverauto-portal.sh assign --task-id <id> --worker <name> \
 #     [--pr-url <https-url>] [--issue-url <https-url>] [--buildbuddy-url <https-url>]
 #
-# --stream is required. Task id and worker are required. Any URL that is
-# supplied must be a full https URL (PR, issue, or BuildBuddy check).
+# Task id and worker are required. Any URL that is supplied must be a full
+# https URL (PR, issue, or BuildBuddy check).
 #
 # An assignment is its own message family, not a steer: subject
 # firstmate.assign.<task-id>, JSON payload schema
 # fm-carverauto-portal-assign.v1. It is published here rather than through
 # bin/fm-steer.sh, whose subject and schema are pinned to the steering-inbox
 # contract. Nothing on this path touches the on-disk steering inbox.
+#
+# The payload is published byte for byte, which needs a nats CLI new enough
+# for --templates.
 #
 # Default portal_url: https://firstmate.carverauto.dev
 # bin/fm-carverauto-lib.sh owns overlay opt-in, URL resolution, and the nats
@@ -35,7 +38,6 @@ usage() {
 }
 
 CMD=
-STREAM=
 TASK_ID=
 WORKER=
 PR_URL=
@@ -49,11 +51,6 @@ while [ "$#" -gt 0 ]; do
       [ -z "$CMD" ] || die "multiple commands"
       CMD=$1
       shift
-      ;;
-    --stream)
-      [ -n "${2-}" ] || die "--stream needs a name"
-      STREAM=$2
-      shift 2
       ;;
     --task-id)
       [ -n "${2-}" ] || die "--task-id needs a value"
@@ -87,8 +84,6 @@ while [ "$#" -gt 0 ]; do
 done
 
 [ "$CMD" = assign ] || die "command required: assign"
-[ -n "$STREAM" ] || die "--stream is required"
-fm_carverauto_valid_token "$STREAM" || die "invalid --stream (use a NATS-safe token, no path separators)"
 [ -n "$TASK_ID" ] || die "--task-id is required"
 fm_carverauto_valid_token "$TASK_ID" || die "invalid --task-id (use a NATS-safe token, no path separators)"
 [ -n "$WORKER" ] || die "--worker is required"
@@ -127,6 +122,6 @@ PY
 )
 
 SUBJECT="firstmate.assign.${TASK_ID}"
-fm_carverauto_nats_run publish "$SUBJECT" -- "$PAYLOAD" >&2 \
-  || { printf 'error: nats publish to %s failed\n' "$SUBJECT" >&2; exit 1; }
-printf 'assign: stream=%s subject=%s task=%s worker=%s\n' "$STREAM" "$SUBJECT" "$TASK_ID" "$WORKER"
+fm_carverauto_nats_run publish --templates=false "$SUBJECT" -- "$PAYLOAD" >&2 \
+  || { printf 'error: nats publish to %s failed (the overlay needs a nats CLI that supports --templates)\n' "$SUBJECT" >&2; exit 1; }
+printf 'assign: subject=%s task=%s worker=%s\n' "$SUBJECT" "$TASK_ID" "$WORKER"

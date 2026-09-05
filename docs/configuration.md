@@ -506,7 +506,7 @@ NATS credentials stay in the `nats` CLI environment (`NATS_USER`, `NATS_PASSWORD
 Never commit those values.
 
 `bin/fm-steer.sh` is the OpenSpec CLI (`put`/`next`/`ack`/`list`, required `--stream`, subject `firstmate.steer.<task>`, payload `fm-task-inbox.v1`).
-JetStream is its only store: it needs the `nats` CLI, and a steer is pending until the durable consumer acknowledges it.
+JetStream is its only store: it needs a `nats` CLI new enough to support `--templates`, so a steer body is published byte for byte, and a steer stays pending until `ack --stream-seq` acknowledges the exact steer `next` reported.
 A portal assignment is a separate family on `firstmate.assign.<task>` with its own publisher.
 `bin/fm-steer.sh` never deletes a task's on-disk inbox under `state/<id>.inbox/`.
 Dual-write is additive only, and a dual-write that cannot reach NATS is a notice, never a failed steer.

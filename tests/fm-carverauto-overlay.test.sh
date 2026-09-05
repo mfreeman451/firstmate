@@ -3,9 +3,10 @@
 #
 # Drives the public notify, steer, and portal executables plus fm-send's
 # additive dual-write. JetStream is the steer inbox's only store, so a fake
-# nats broker (publish into a directory, one durable consumer served from it)
-# stands in for the server and lets put/next/ack/list be asserted end to end.
-# Discord tokens never appear on argv or in wrapper output.
+# nats broker stands in for the server: it stores published messages, models
+# the one durable consumer (delivery, negative acknowledgement, ack floor) and
+# models natscli's Go-template expansion of a publish body, which is what the
+# CLI must switch off. Discord tokens never appear on argv or in wrapper output.
 # shellcheck disable=SC2016
 set -u
 
@@ -37,10 +38,14 @@ PY
   chmod +x "$dir/notify.py"
 }
 
-# A fake NATS server for the subset of the CLI the overlay uses: publish stores
-# subject+body under $NATS_STORE/msgs, `consumer next` serves the head of the
-# one durable consumer (acknowledging only when --ack advances its floor), and
-# `consumer info --json` reports what that consumer has not acknowledged.
+# A fake NATS server for the subset of the CLI the overlay uses.
+#   publish        stores subject+body under $NATS_STORE/msgs, and - like
+#                  natscli - expands {{Count}} in the body unless the publisher
+#                  passed --templates=false
+#   consumer next  serves the head of the one durable consumer: --nak leaves it
+#                  pending and first in line, --ack advances the ack floor
+#   consumer info  reports that consumer's delivered/ack_floor sequences and
+#                  its undelivered and delivered-unacked counts
 make_nats_stub() {  # <dir>
   local fb="$1/fakebin"
   mkdir -p "$fb"
@@ -60,32 +65,64 @@ while [ $# -gt 0 ]; do
 done
 printf 'argv=%s\n' "$(printf '%s ' "${args[@]+"${args[@]}"}")" >>"$store/argv.log"
 stored() { ls -1 "$store/msgs"/*.body 2>/dev/null | wc -l | tr -d ' '; }
-floor() { cat "$store/floor" 2>/dev/null || printf '0'; }
+state_get() { cat "$store/$1" 2>/dev/null || printf '0'; }
 case "${args[0]:-}" in
   publish)
+    templates=1
+    rest=()
+    for a in "${args[@]:1}"; do
+      case "$a" in
+        --templates=false) templates=0 ;;
+        --) ;;
+        *) rest+=("$a") ;;
+      esac
+    done
+    body=${rest[1]:-}
+    if [ "$templates" = 1 ]; then
+      body=${body//\{\{Count\}\}/1}
+    fi
     n=$(( $(stored) + 1 ))
-    printf '%s' "${args[1]}" >"$store/msgs/$(printf '%04d' "$n").subject"
-    printf '%s' "${args[$(( ${#args[@]} - 1 ))]}" >"$store/msgs/$(printf '%04d' "$n").body"
+    printf '%s' "${rest[0]}" >"$store/msgs/$(printf '%04d' "$n").subject"
+    printf '%s' "$body" >"$store/msgs/$(printf '%04d' "$n").body"
     exit 0 ;;
   consumer)
     case "${args[1]:-}" in
       next)
         ack=0
+        nak=0
         for a in "${args[@]}"; do
-          case "$a" in --ack) ack=1 ;; esac
+          case "$a" in
+            --ack) ack=1 ;;
+            --nak) nak=1 ;;
+          esac
         done
-        n=$(( $(floor) + 1 ))
-        [ -f "$store/msgs/$(printf '%04d' "$n").body" ] \
+        head=$(state_get nak)
+        if [ "$head" = 0 ]; then
+          head=$(( $(state_get delivered) + 1 ))
+        fi
+        [ -f "$store/msgs/$(printf '%04d' "$head").body" ] \
           || { printf 'nats: no message\n' >&2; exit 1; }
-        cat "$store/msgs/$(printf '%04d' "$n").body"
+        cat "$store/msgs/$(printf '%04d' "$head").body"
         printf '\n'
+        printf '%s' "$head" >"$store/delivered"
         if [ "$ack" = 1 ]; then
-          printf '%s' "$n" >"$store/floor"
+          printf '%s' "$head" >"$store/floor"
+          printf '0' >"$store/nak"
+        elif [ "$nak" = 1 ]; then
+          printf '%s' "$head" >"$store/nak"
+        else
+          printf '0' >"$store/nak"
         fi
         exit 0 ;;
       info)
-        printf '{"stream_name":"%s","name":"%s","num_ack_pending":0,"num_pending":%s}\n' \
-          "${args[2]:-}" "${args[3]:-}" "$(( $(stored) - $(floor) ))"
+        ackpending=0
+        [ "$(state_get nak)" = 0 ] || ackpending=1
+        printf '{"stream_name":"%s","name":"%s","delivered":{"consumer_seq":%s,"stream_seq":%s},' \
+          "${args[2]:-}" "${args[3]:-}" "$(state_get delivered)" "$(state_get delivered)"
+        printf '"ack_floor":{"consumer_seq":%s,"stream_seq":%s},' \
+          "$(state_get floor)" "$(state_get floor)"
+        printf '"num_ack_pending":%s,"num_redelivered":0,"num_waiting":0,"num_pending":%s}\n' \
+          "$ackpending" "$(( $(stored) - $(state_get delivered) ))"
         exit 0 ;;
     esac
     ;;
@@ -133,12 +170,19 @@ SH
   chmod +x "$fb/sleep"
 }
 
-# steer <dir> -- <fm-steer args...>: run the CLI against that dir's fake broker.
+# steer <dir> <fm-steer args...>: run the CLI against that dir's fake broker.
 steer() {
   local dir=$1; shift
   env PATH="$dir/fakebin:$PATH" FM_HOME="$dir/home" \
     NATS_STORE="$dir/nats" FM_CARVERAUTO_NATS_URL=nats://127.0.0.1:4222 \
     "$STEER" "$@"
+}
+
+portal() {  # <dir> <fm-carverauto-portal args...>
+  local dir=$1; shift
+  env PATH="$dir/fakebin:$PATH" FM_HOME="$dir/home" \
+    NATS_STORE="$dir/nats" FM_CARVERAUTO_NATS_URL=nats://127.0.0.1:4222 \
+    "$PORTAL" "$@"
 }
 
 # The nth published message, "<subject>\n<payload>".
@@ -154,9 +198,19 @@ published_count() {  # <dir>
   ls -1 "$1/nats/msgs"/*.body 2>/dev/null | wc -l | tr -d ' '
 }
 
-# The body of an envelope or of a next/ack payload: everything after the "--".
-envelope_body() {
+# Everything after the first "--" line: the envelope out of a next report, or
+# the steer body out of an envelope.
+after_separator() {
   awk 'seen { print } $0 == "--" { seen=1 }'
+}
+
+# The JetStream sequence a next report names as the steer it delivered.
+reported_stream_seq() {
+  awk -F'stream-seq=' 'NF > 1 { print $2; exit }'
+}
+
+pending_count() {  # <dir> <stream>
+  steer "$1" list --stream "$2" | awk -F'pending=' 'NF > 1 { print $2; exit }'
 }
 
 setup_overlay_dir() {  # <name> -> echoes a dir with fakebin, home, and store
@@ -191,11 +245,22 @@ test_put_publishes_the_full_envelope() {
   assert_contains "$msg" $'\ntask=t1\n' "the payload carries the task"
   assert_contains "$msg" $'\nseq=3\n' "the payload carries the record sequence"
   assert_contains "$msg" 'at=' "the payload carries the enqueue time"
-  [ "$(printf '%s\n' "$msg" | envelope_body)" = $'steer body\nline 2' ] \
+  [ "$(printf '%s\n' "$msg" | after_separator)" = $'steer body\nline 2' ] \
     || fail "the payload body did not survive the publish: $msg"
   assert_contains "$(cat "$dir/nats/argv.log")" "server=nats://127.0.0.1:4222" \
     "the configured NATS URL should reach the nats CLI"
   pass "fm-steer: put publishes the whole fm-task-inbox.v1 envelope"
+}
+
+test_put_sends_the_body_bytes_unchanged() {
+  local dir body msg
+  dir=$(setup_overlay_dir put-bytes)
+  body='the log line prints {{Count}} instead of the request time'
+  steer "$dir" put --stream firstmate --task t1 --seq 1 --body "$body" >/dev/null
+  msg=$(published "$dir" 1) || fail "put published nothing"
+  [ "$(printf '%s\n' "$msg" | after_separator)" = "$body" ] \
+    || fail "the steer body was rewritten in flight: $msg"
+  pass "fm-steer: put publishes the steer body byte for byte"
 }
 
 test_put_marks_fire_and_forget() {
@@ -229,11 +294,11 @@ test_put_requires_the_contract_fields() {
   pass "fm-steer: put refuses an envelope it cannot complete"
 }
 
-test_steer_subject_and_schema_are_pinned() {
+test_steer_has_no_contract_escape_hatches() {
   local dir err rc flag
   dir=$(setup_overlay_dir pinned)
   err="$dir/err"
-  for flag in --subject --schema --id; do
+  for flag in --subject --schema --id --consumer; do
     set +e
     steer "$dir" put --stream firstmate --task t1 --seq 1 "$flag" x --body y \
       >/dev/null 2>"$err"
@@ -244,41 +309,81 @@ test_steer_subject_and_schema_are_pinned() {
       "the refusal should name the rejected flag"
   done
   [ "$(published_count "$dir")" = 0 ] || fail "a refused put must publish nothing"
-  pass "fm-steer: the steer subject and schema cannot be overridden"
+  pass "fm-steer: the steer subject, schema, and durable consumer cannot be overridden"
 }
 
-test_next_peeks_and_ack_handles() {
-  local dir out
+test_next_peeks_and_ack_handles_that_steer() {
+  local dir out seq
   dir=$(setup_overlay_dir next-ack)
   steer "$dir" put --stream firstmate --task t1 --seq 1 --body "please rebase" >/dev/null
   steer "$dir" put --stream firstmate --task t2 --seq 1 --body "second steer" >/dev/null
-  assert_contains "$(steer "$dir" list --stream firstmate)" "pending=2" \
-    "list should report both unacknowledged steers"
+  [ "$(pending_count "$dir" firstmate)" = 2 ] \
+    || fail "list should report both unacknowledged steers"
   out=$(steer "$dir" next --stream firstmate)
-  assert_contains "$out" "schema=fm-task-inbox.v1" "next should return the published envelope"
-  [ "$(printf '%s\n' "$out" | envelope_body)" = "please rebase" ] \
+  seq=$(printf '%s\n' "$out" | reported_stream_seq)
+  [ -n "$seq" ] || fail "next should report the steer's JetStream sequence: $out"
+  [ "$(printf '%s\n' "$out" | after_separator | after_separator)" = "please rebase" ] \
     || fail "next did not round-trip the body: $out"
-  assert_contains "$(steer "$dir" list --stream firstmate)" "pending=2" \
-    "next alone must not mark a steer handled"
-  steer "$dir" ack --stream firstmate >/dev/null
-  assert_contains "$(steer "$dir" list --stream firstmate)" "pending=1" \
-    "ack is what marks a steer handled"
-  steer "$dir" ack --stream firstmate >/dev/null
-  assert_contains "$(steer "$dir" list --stream firstmate)" "pending=0" \
-    "list is the consumer's unacked count, not the stream's history"
-  pass "fm-steer: next peeks, ack handles, list is pending"
+  [ "$(pending_count "$dir" firstmate)" = 2 ] \
+    || fail "next alone must not mark a steer handled"
+  [ "$(printf '%s\n' "$(steer "$dir" next --stream firstmate)" | reported_stream_seq)" = "$seq" ] \
+    || fail "a second peek should return the same unhandled steer"
+  steer "$dir" ack --stream firstmate --stream-seq "$seq" >/dev/null
+  [ "$(pending_count "$dir" firstmate)" = 1 ] \
+    || fail "ack is what marks a steer handled"
+  pass "fm-steer: next peeks the head and ack handles that same steer"
+}
+
+test_repeated_ack_never_handles_an_unread_steer() {
+  local dir out seq second
+  dir=$(setup_overlay_dir ack-repeat)
+  steer "$dir" put --stream firstmate --task t1 --seq 1 --body "first steer" >/dev/null
+  steer "$dir" put --stream firstmate --task t2 --seq 1 --body "second steer" >/dev/null
+  seq=$(steer "$dir" next --stream firstmate | reported_stream_seq)
+  steer "$dir" ack --stream firstmate --stream-seq "$seq" >/dev/null
+  out=$(steer "$dir" ack --stream firstmate --stream-seq "$seq") \
+    || fail "re-acknowledging a handled steer should succeed"
+  assert_contains "$out" "already handled" "the repeat should report the steer was already handled"
+  [ "$(pending_count "$dir" firstmate)" = 1 ] \
+    || fail "the repeated ack handled a steer nobody read"
+  second=$(steer "$dir" next --stream firstmate | after_separator | after_separator)
+  [ "$second" = "second steer" ] \
+    || fail "the unread steer should still be deliverable, got: $second"
+  pass "fm-steer: a repeated ack never handles a steer nobody read"
+}
+
+test_ack_refuses_another_sequence() {
+  local dir err rc
+  dir=$(setup_overlay_dir ack-guard)
+  err="$dir/err"
+  steer "$dir" put --stream firstmate --task t1 --seq 1 --body "only steer" >/dev/null
+  set +e
+  steer "$dir" ack --stream firstmate >/dev/null 2>"$err"
+  rc=$?
+  set -e
+  expect_code 2 "$rc" "ack without a sequence must refuse"
+  assert_contains "$(cat "$err")" "--stream-seq" "the refusal should name --stream-seq"
+  set +e
+  steer "$dir" ack --stream firstmate --stream-seq 99 >/dev/null 2>"$err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "ack of a sequence the consumer never delivered must refuse"
+  assert_contains "$(cat "$err")" "run next first" "the refusal should say how to get a sequence"
+  [ "$(pending_count "$dir" firstmate)" = 1 ] \
+    || fail "a refused ack must leave the steer pending"
+  pass "fm-steer: ack refuses a sequence next did not report"
 }
 
 test_inbox_does_not_touch_task_disk_inbox() {
-  local dir rec checksum after
+  local dir rec checksum after seq
   dir=$(setup_overlay_dir disk-guard)
   mkdir -p "$dir/home/state/t1.inbox"
   rec="$dir/home/state/t1.inbox/001.msg"
   printf 'schema=fm-task-inbox.v1\nat=now\n--\nkeep me\n' >"$rec"
   checksum=$(cksum "$rec")
   steer "$dir" put --stream firstmate --task t1 --seq 1 --body "overlay" >/dev/null
-  steer "$dir" next --stream firstmate >/dev/null
-  steer "$dir" ack --stream firstmate >/dev/null
+  seq=$(steer "$dir" next --stream firstmate | reported_stream_seq)
+  steer "$dir" ack --stream firstmate --stream-seq "$seq" >/dev/null
   [ -f "$rec" ] || fail "the on-disk task inbox was removed"
   after=$(cksum "$rec")
   [ "$checksum" = "$after" ] || fail "the on-disk task inbox was modified"
@@ -303,6 +408,24 @@ test_notify_captain_needed_includes_portal_and_hides_token() {
   assert_contains "$(cat "$log")" "Need a token" "title should reach notify.py"
   assert_contains "$(cat "$log")" "https://firstmate.carverauto.dev" "portal URL should be in the body"
   pass "notify: captain-needed pages Discord with the portal URL and no webhook on argv"
+}
+
+test_notify_portal_url_cannot_be_suppressed() {
+  local home log err rc
+  home="$TMP_ROOT/notify-portal"
+  mkdir -p "$home"
+  make_notify_stub "$home"
+  log="$home/notify.log"
+  err="$home/err"
+  set +e
+  FM_CARVERAUTO_NOTIFY_PY="$home/notify.py" NOTIFY_LOG="$log" \
+    "$NOTIFY" captain-needed --title "Quiet page" --no-portal >/dev/null 2>"$err"
+  rc=$?
+  set -e
+  expect_code 2 "$rc" "a page must not be able to drop the portal URL"
+  assert_contains "$(cat "$err")" "unknown option: --no-portal" "the refusal should name the flag"
+  [ ! -s "$log" ] || fail "a refused page must not reach Discord: $(cat "$log")"
+  pass "notify: every captain-attention page carries the portal URL"
 }
 
 test_notify_pr_landed_rejects_bare_number() {
@@ -346,15 +469,13 @@ test_notify_archify_requires_a_diagram() {
 }
 
 test_portal_assign_publishes_its_own_family() {
-  local dir out msg
+  local dir out msg err rc
   dir=$(setup_overlay_dir portal)
-  out=$(env PATH="$dir/fakebin:$PATH" FM_HOME="$dir/home" \
-    NATS_STORE="$dir/nats" FM_CARVERAUTO_NATS_URL=nats://127.0.0.1:4222 \
-    "$PORTAL" assign --stream firstmate --task-id t1 --worker grok \
+  out=$(portal "$dir" assign --task-id t1 --worker grok \
     --pr-url https://github.com/mfreeman451/firstmate/pull/1 \
     --buildbuddy-url https://app.buildbuddy.io/invocation/abc)
-  assert_contains "$out" "stream=firstmate" "portal assign should name the stream"
   assert_contains "$out" "subject=firstmate.assign.t1" "an assignment is its own subject family"
+  assert_not_contains "$out" "stream=" "the assignment publish names no stream it never contacted"
   msg=$(published "$dir" 1) || fail "portal assign published nothing"
   assert_not_contains "$msg" "firstmate.steer" "an assignment must not ride the steer subject"
   assert_contains "$msg" '"schema":"fm-carverauto-portal-assign.v1"' "payload should use the assignment schema"
@@ -363,6 +484,13 @@ test_portal_assign_publishes_its_own_family() {
   assert_contains "$msg" 'https://github.com/mfreeman451/firstmate/pull/1' "payload should include the PR URL"
   assert_contains "$msg" 'https://app.buildbuddy.io/invocation/abc' "payload should include the BuildBuddy URL"
   assert_contains "$msg" 'https://firstmate.carverauto.dev' "payload should include the portal URL"
+  err="$dir/err"
+  set +e
+  portal "$dir" assign --stream firstmate --task-id t1 --worker grok >/dev/null 2>"$err"
+  rc=$?
+  set -e
+  expect_code 2 "$rc" "the assignment publisher takes no --stream"
+  assert_contains "$(cat "$err")" "unknown option: --stream" "the refusal should name the flag"
   pass "portal: assign publishes task, worker, and https URLs on firstmate.assign.<task>"
 }
 
@@ -371,8 +499,7 @@ test_portal_rejects_non_https() {
   dir=$(setup_overlay_dir portal-bad)
   err="$dir/err"
   set +e
-  env PATH="$dir/fakebin:$PATH" FM_HOME="$dir/home" NATS_STORE="$dir/nats" \
-    "$PORTAL" assign --stream firstmate --task-id t1 --worker grok \
+  portal "$dir" assign --task-id t1 --worker grok \
     --issue-url http://example.invalid/issues/1 >/dev/null 2>"$err"
   rc=$?
   set -e
@@ -381,7 +508,7 @@ test_portal_rejects_non_https() {
   pass "portal: issue URLs must be https"
 }
 
-# run_send <dir> -- <fm-send args...>: fm-send against that dir's home, with the
+# run_send <dir> <fm-send args...>: fm-send against that dir's home, with the
 # tmux and nats stubs on PATH and the overlay's store pinned to the dir.
 run_send() {
   local dir=$1; shift
@@ -400,16 +527,16 @@ test_send_dual_write_keeps_disk_inbox() {
   printf 'on\n' >"$dir/home/config/carverauto-overlay"
   printf 'firstmate\n' >"$dir/home/config/carverauto-inbox-stream"
   : >"$dir/send.log"
-  run_send "$dir" t1 "please rebase onto main" >/dev/null
+  run_send "$dir" t1 "please rebase onto main {{Count}}" >/dev/null
   rec="$dir/home/state/t1.inbox/001.msg"
   [ -f "$rec" ] || fail "dual-write must not skip the on-disk inbox"
   body=$(bash -c '. "$1"; fm_task_inbox_body "$2"' _ "$ROOT/bin/fm-task-inbox-lib.sh" "$rec")
-  [ "$body" = "please rebase onto main" ] || fail "disk inbox body changed: $body"
+  [ "$body" = "please rebase onto main {{Count}}" ] || fail "disk inbox body changed: $body"
   msg=$(published "$dir" 1) || fail "fm-send did not dual-write onto JetStream"
   assert_contains "$msg" "firstmate.steer.t1" "dual-write subject is firstmate.steer.<task>"
   assert_contains "$msg" "schema=fm-task-inbox.v1" "dual-write payload uses the inbox schema"
   assert_contains "$msg" $'\nseq=1\n' "dual-write carries the disk record's sequence"
-  [ "$(printf '%s\n' "$msg" | envelope_body)" = "please rebase onto main" ] \
+  [ "$(printf '%s\n' "$msg" | after_separator)" = "$body" ] \
     || fail "dual-write body diverged from the disk record: $msg"
   pass "fm-send: overlay dual-write is additive and keeps the on-disk inbox"
 }
@@ -448,12 +575,16 @@ test_send_without_overlay_skips_dual_write() {
 
 test_stream_required
 test_put_publishes_the_full_envelope
+test_put_sends_the_body_bytes_unchanged
 test_put_marks_fire_and_forget
 test_put_requires_the_contract_fields
-test_steer_subject_and_schema_are_pinned
-test_next_peeks_and_ack_handles
+test_steer_has_no_contract_escape_hatches
+test_next_peeks_and_ack_handles_that_steer
+test_repeated_ack_never_handles_an_unread_steer
+test_ack_refuses_another_sequence
 test_inbox_does_not_touch_task_disk_inbox
 test_notify_captain_needed_includes_portal_and_hides_token
+test_notify_portal_url_cannot_be_suppressed
 test_notify_pr_landed_rejects_bare_number
 test_notify_archify_requires_a_diagram
 test_portal_assign_publishes_its_own_family

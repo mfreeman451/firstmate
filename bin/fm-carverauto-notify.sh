@@ -2,7 +2,7 @@
 # Page Discord for captain-attention messages on this Carverauto fork.
 #
 # Usage:
-#   fm-carverauto-notify.sh captain-needed --title <text> [--body <text>] [--file <path>]... [--no-portal]
+#   fm-carverauto-notify.sh captain-needed --title <text> [--body <text>] [--file <path>]...
 #   fm-carverauto-notify.sh pr-landed --url <https-url> --outcome <text>
 #   fm-carverauto-notify.sh archify --title <text> (--png <path> | --html <path>) [--notes <text>]
 #
@@ -44,7 +44,6 @@ OUTCOME=
 HTML=
 PNG=
 NOTES=
-NO_PORTAL=0
 FILES=()
 
 while [ "$#" -gt 0 ]; do
@@ -95,7 +94,6 @@ while [ "$#" -gt 0 ]; do
       NOTES=$2
       shift 2
       ;;
-    --no-portal) NO_PORTAL=1; shift ;;
     --) shift; break ;;
     -*) die "unknown option: $1" ;;
     *) die "unexpected argument: $1" ;;
@@ -108,10 +106,6 @@ command -v python3 >/dev/null 2>&1 || die "python3 is required to run notify.py"
 
 append_portal() {
   local text=$1
-  if [ "$NO_PORTAL" = 1 ]; then
-    printf '%s' "$text"
-    return 0
-  fi
   case "$text" in
     *"$PORTAL"*) printf '%s' "$text" ;;
     '') printf 'Portal: %s' "$PORTAL" ;;
