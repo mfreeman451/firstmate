@@ -250,6 +250,21 @@ test_send_without_overlay_skips_dual_write() {
   pass "fm-send: overlay off leaves the disk inbox as the only store"
 }
 
+test_put_body_flag_matches_openspec() {
+  local home listed body
+  home="$TMP_ROOT/put-body"
+  mkdir -p "$home/state"
+  FM_HOME="$home" FM_CARVERAUTO_INBOX_BACKEND=file \
+    "$INBOX" put --stream firstmate-steer --task fm-hub --body "please rebase" >/dev/null
+  listed=$(FM_HOME="$home" FM_CARVERAUTO_INBOX_BACKEND=file \
+    "$INBOX" list --stream firstmate-steer)
+  assert_contains "$listed" "firstmate.steer.fm-hub" "OpenSpec put uses firstmate.steer.<task>"
+  body=$(FM_HOME="$home" FM_CARVERAUTO_INBOX_BACKEND=file \
+    "$INBOX" next --stream firstmate-steer | awk 'seen { print } $0 == "--" { seen=1 }')
+  [ "$body" = "please rebase" ] || fail "--body did not round-trip: $body"
+  pass "inbox CLI: put --stream --task --body matches the OpenSpec agent publish"
+}
+
 test_nats_backend_put_uses_nats_cli() {
   local home fb log out
   home="$TMP_ROOT/nats-put"
@@ -281,4 +296,5 @@ test_portal_assign_publishes_json
 test_portal_rejects_non_https
 test_send_dual_write_keeps_disk_inbox
 test_send_without_overlay_skips_dual_write
+test_put_body_flag_matches_openspec
 test_nats_backend_put_uses_nats_cli

@@ -2,12 +2,12 @@
 # This fork's fm-steer CLI: JetStream steering inbox for Carverauto.
 #
 # Usage:
-#   fm-carverauto-inbox.sh put  --stream <name> [--subject <subject>] [--task <id>] [--seq <n>] [--delivery fire-and-forget]
+#   fm-carverauto-inbox.sh put  --stream <name> [--task <id>] [--body <text>] [--subject <subject>] [--seq <n>] [--delivery fire-and-forget]
 #   fm-carverauto-inbox.sh next --stream <name> [--consumer <name>]
 #   fm-carverauto-inbox.sh ack  --stream <name> --ack <ack-id>
 #   fm-carverauto-inbox.sh list --stream <name>
 #
-# --stream is required on every command. Body for put is stdin.
+# --stream is required on every command. Body for put is --body or stdin.
 # bin/fm-steer.sh is the same CLI under the OpenSpec command name.
 #
 # Contract (OpenSpec add-firstmate-portal in firstmate-notify):
@@ -58,6 +58,7 @@ SCHEMA=
 TASK_ID=
 SEQ_ARG=
 DELIVERY=
+BODY_ARG=
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -111,6 +112,11 @@ while [ "$#" -gt 0 ]; do
       [ -n "${2-}" ] || die "--delivery needs a value"
       [ "$2" = fire-and-forget ] || die "--delivery must be fire-and-forget"
       DELIVERY=$2
+      shift 2
+      ;;
+    --body)
+      [ -n "${2-}" ] || die "--body needs a value"
+      BODY_ARG=$2
       shift 2
       ;;
     --) shift; break ;;
@@ -185,9 +191,18 @@ nats_args() {
   fi
 }
 
+put_body() {
+  if [ -n "$BODY_ARG" ]; then
+    printf '%s' "$BODY_ARG"
+    return 0
+  fi
+  [ ! -t 0 ] || die "put requires --body or stdin"
+  cat
+}
+
 cmd_put_file() {
   local dir seq_file seq dest body tmp
-  body=$(cat)
+  body=$(put_body)
   dir=$(file_stream_dir)
   file_lock_acquire "$dir"
   seq_file="$dir/seq"
@@ -297,7 +312,7 @@ cmd_put_nats() {
   local nats bodyfile extra=()
   nats=$(nats_bin)
   bodyfile=$(mktemp "${TMPDIR:-/tmp}/fm-carverauto-put.XXXXXX")
-  cat >"$bodyfile"
+  put_body >"$bodyfile"
   extra=()
   while IFS= read -r arg; do
     [ -n "$arg" ] && extra+=("$arg")
