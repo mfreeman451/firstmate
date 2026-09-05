@@ -490,7 +490,8 @@ It is not part of upstream firstmate.
 The `carverauto-overlay` skill owns when firstmate pages Discord, dual-writes a steer, or publishes a portal assignment.
 Script headers own exact flags.
 
-Opt in with gitignored `config/carverauto-overlay` containing `on`, or `FM_CARVERAUTO_OVERLAY=on`.
+Opt in with gitignored `config/carverauto-overlay` containing exactly `on`, or `FM_CARVERAUTO_OVERLAY=on` (`1` also works for the environment override).
+Any other value, including absent, leaves the overlay off.
 Absent means inert: `fm-send` keeps the on-disk steering inbox and does not dual-write.
 This overlay is not inherited by secondmate homes.
 
@@ -507,7 +508,7 @@ Never commit those values.
 
 `bin/fm-steer.sh` is the OpenSpec CLI (`put`/`next`/`ack`/`list`, required `--stream`, subject `firstmate.steer.<task>`, payload `fm-task-inbox.v1`).
 JetStream is its only store: it needs natscli 0.4.0 or newer, whose `--templates=false` keeps a steer body byte for byte (older ones expand `{{...}}` in it and are refused), and a steer stays pending until `ack --stream-seq` acknowledges the exact steer `next` reported.
-`put` publishes to JetStream and fails when no stream stored the steer, or when the stream that acknowledged it is not the one `--stream` named, so the stream capturing `firstmate.steer.>` must exist first and its name must match (NATS stream names are case-sensitive).
+`put` reads the named stream's own subject set first and refuses when `--stream` does not capture `firstmate.steer.<task>`, so the stream must exist before a steer is published and its name must match (NATS stream names are case-sensitive); the publish itself is a JetStream publish, which fails rather than reporting a delivery nothing stored.
 `next`, `ack`, and `list` address a durable pull consumer named after the stream, with `AckPolicy=explicit`; create it with `nats consumer add` before using them, because the overlay never provisions it.
 A portal assignment is a separate family on `firstmate.assign.<task>` with its own publisher.
 `bin/fm-steer.sh` never deletes a task's on-disk inbox under `state/<id>.inbox/`.

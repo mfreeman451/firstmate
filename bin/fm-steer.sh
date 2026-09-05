@@ -9,7 +9,7 @@
 #   fm-steer.sh list --stream <name>
 #
 # --stream is required on every command and names the durable consumer too.
-# Body for put is --body or stdin.
+# The steer body for put is --body.
 #
 # Contract (OpenSpec add-firstmate-portal in firstmate-notify):
 #   put/next/ack/list, required --stream, subject firstmate.steer.<task>,
@@ -19,9 +19,10 @@
 # nothing else. A portal assignment is a different family with its own
 # publisher (bin/fm-carverauto-portal.sh), not an override here.
 #
-# JetStream is the only store. put is a JetStream publish, so its acknowledgement
-# proves a stream actually stored the steer; a subject no stream captures fails
-# the put instead of reporting a delivery that never happened. The body is
+# JetStream is the only store. put first reads the named stream's own subject
+# set, so a --stream that does not capture firstmate.steer.<task> is refused
+# before anything is published; the publish itself is a JetStream publish, so
+# its acknowledgement proves the steer was actually stored. The body is
 # published unchanged, which needs natscli 0.4.0 or newer: older ones expand Go
 # templates such as {{Count}} in the body, so bin/fm-carverauto-lib.sh refuses
 # to publish through them rather than send a steer that differs from the
@@ -124,13 +125,35 @@ done
 [ -n "$STREAM" ] || die "--stream is required"
 fm_carverauto_valid_token "$STREAM" || die "invalid --stream (use a NATS-safe token, no path separators)"
 
-put_body() {
-  if [ -n "$BODY_ARG" ]; then
-    printf '%s' "$BODY_ARG"
-    return 0
-  fi
-  [ ! -t 0 ] || die "put requires --body or stdin"
-  cat
+# The named stream's own description. Every command that names a stream proves
+# it exists through this, so a stream that is not there is a refusal rather
+# than a message stored somewhere the operator was never told about.
+stream_info() {
+  local info
+  command -v python3 >/dev/null 2>&1 \
+    || fail "python3 is required to read the stream description"
+  info=$(fm_carverauto_nats_run stream info "$STREAM" --json) \
+    || fail "nats stream info failed for stream $STREAM; create it before using this inbox"
+  printf '%s' "$info"
+}
+
+# Whether the stream's configured subject set captures this subject, by the
+# same token rules NATS applies: * matches one token, > the rest.
+stream_captures() {  # <stream-info-json> <subject>
+  printf '%s' "$1" | python3 -c 'import json, sys
+subject = sys.argv[1].split(".")
+
+def matches(subject_filter):
+    tokens = subject_filter.split(".")
+    for i, token in enumerate(tokens):
+        if token == ">":
+            return i < len(subject)
+        if i >= len(subject) or (token != "*" and token != subject[i]):
+            return False
+    return len(tokens) == len(subject)
+
+subjects = json.load(sys.stdin).get("config", {}).get("subjects", [])
+sys.exit(0 if any(matches(s) for s in subjects) else 1)' "$2"
 }
 
 # The durable consumer's state as four numbers:
@@ -151,31 +174,25 @@ print(int(d.get("num_pending", 0)),
 }
 
 cmd_put() {
-  local body payload ack
+  local payload subject
   [ -n "$TASK_ID" ] || die "put requires --task (the subject is firstmate.steer.<task>)"
   fm_carverauto_valid_token "$TASK_ID" || die "invalid --task (use a NATS-safe token, no path separators)"
   [ -n "$SEQ_ARG" ] || die "put requires --seq (the fm-task-inbox.v1 record sequence)"
   case "$SEQ_ARG" in
     *[!0-9]*) die "--seq must be a number" ;;
   esac
-  body=$(put_body)
+  [ -n "$BODY_ARG" ] || die "put requires --body"
+  subject="firstmate.steer.${TASK_ID}"
+  stream_captures "$(stream_info)" "$subject" \
+    || fail "stream $STREAM does not capture $subject; --stream and the stream holding this fork's steers disagree"
   payload="schema=$SCHEMA"$'\n'"at=$(fm_carverauto_now)"$'\n'"task=$TASK_ID"$'\n'"seq=$SEQ_ARG"$'\n'
   if [ "$DELIVERY" = fire-and-forget ]; then
     payload="${payload}delivery=fire-and-forget"$'\n'
   fi
-  payload="${payload}--"$'\n'"$body"
-  ack=$(fm_carverauto_nats_publish "firstmate.steer.${TASK_ID}" "$payload" 2>&1) || {
-    [ -z "$ack" ] || printf '%s\n' "$ack" >&2
-    fail "nats publish to firstmate.steer.${TASK_ID} failed"
-  }
-  case "$ack" in
-    *"Stored in Stream: $STREAM Sequence:"*) ;;
-    *)
-      [ -z "$ack" ] || printf '%s\n' "$ack" >&2
-      fail "firstmate.steer.${TASK_ID} was not stored in stream $STREAM; the JetStream acknowledgement names a different stream, so --stream and the stream capturing that subject disagree"
-      ;;
-  esac
-  printf 'put: stream=%s subject=firstmate.steer.%s seq=%s\n' "$STREAM" "$TASK_ID" "$SEQ_ARG"
+  payload="${payload}--"$'\n'"$BODY_ARG"
+  fm_carverauto_nats_publish "$subject" "$payload" >&2 \
+    || fail "nats publish to $subject failed"
+  printf 'put: stream=%s subject=%s seq=%s\n' "$STREAM" "$subject" "$SEQ_ARG"
 }
 
 cmd_next() {
@@ -210,10 +227,7 @@ cmd_ack() {
 
 # The stream's highest sequence, which bounds the walk over pending steers.
 stream_last_seq() {
-  local info
-  info=$(fm_carverauto_nats_run stream info "$STREAM" --json) \
-    || fail "nats stream info failed for stream $STREAM"
-  printf '%s' "$info" | python3 -c 'import json, sys
+  stream_info | python3 -c 'import json, sys
 print(int(json.load(sys.stdin).get("state", {}).get("last_seq", 0)))' \
     || fail "nats stream info did not describe stream $STREAM"
 }

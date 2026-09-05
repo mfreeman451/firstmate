@@ -7,9 +7,10 @@
 # this library's output; they stay in the operator's environment or gitignored
 # files owned by firstmate-notify / the NATS CLI.
 #
-# Opt-in is gitignored config/carverauto-overlay containing "on", or
-# FM_CARVERAUTO_OVERLAY set to 1/on/true. Absent means the overlay is inert:
-# fm-send keeps the on-disk steering inbox and does not dual-write.
+# Opt-in is gitignored config/carverauto-overlay containing exactly "on", or
+# FM_CARVERAUTO_OVERLAY set to "on" or "1". Anything else, including absent,
+# leaves the overlay inert: fm-send keeps the on-disk steering inbox and does
+# not dual-write.
 # docs/configuration.md "Carverauto overlay" owns operator setup.
 # This file is sourced, never executed.
 
@@ -51,19 +52,17 @@ fm_carverauto_config_read() {  # <leaf>
   printf '%s' "$val"
 }
 
-fm_carverauto_truthy() {  # <value>
-  case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
-    1|on|true|yes) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
+# ONE opt-in spelling: the config leaf must read exactly "on". The environment
+# override also takes "1", the usual env idiom, and an override that is set to
+# anything else turns the overlay off without consulting the leaf.
 fm_carverauto_overlay_enabled() {
   if [ -n "${FM_CARVERAUTO_OVERLAY+x}" ]; then
-    fm_carverauto_truthy "${FM_CARVERAUTO_OVERLAY:-}"
-    return $?
+    case "${FM_CARVERAUTO_OVERLAY:-}" in
+      on|1) return 0 ;;
+      *) return 1 ;;
+    esac
   fi
-  fm_carverauto_truthy "$(fm_carverauto_config_read carverauto-overlay)"
+  [ "$(fm_carverauto_config_read carverauto-overlay)" = on ]
 }
 
 fm_carverauto_notify_py() {

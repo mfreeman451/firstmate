@@ -51,7 +51,7 @@ The payload is `schema=fm-task-inbox.v1` with `at`, `task`, `seq`, `body`, and o
 Do not invent a different subject or schema.
 
 ```sh
-printf '%s' "$body" | bin/fm-steer.sh put --stream <name> --task <id> --seq <n>
+bin/fm-steer.sh put --stream <name> --task <id> --seq <n> --body "$body"
 bin/fm-steer.sh next --stream <name>
 bin/fm-steer.sh ack --stream <name> --stream-seq <n>
 bin/fm-steer.sh list --stream <name>
@@ -68,7 +68,7 @@ Do not delete those files.
 This CLI has no path that removes a task inbox.
 
 JetStream is the only store: the `nats` CLI must be on PATH and be natscli 0.4.0 or newer (older ones expand `{{...}}` in a steer body and are refused).
-`put` publishes to JetStream, so it fails rather than reporting a delivery when no stream captured the subject.
+`put` checks the named stream's subject set before publishing and publishes to JetStream, so it fails rather than reporting a delivery when `--stream` is not the stream holding the steers.
 `next`, `ack`, and `list` need a durable pull consumer named after the stream (`AckPolicy=explicit`) to exist already; the overlay never creates one.
 NATS credentials stay in that CLI's environment (`NATS_USER`, `NATS_PASSWORD`, `NATS_CREDS`); a server URL that embeds them is refused, because the URL rides argv.
 A dual-write that cannot reach NATS prints a notice; the on-disk record is still the delivered steer.

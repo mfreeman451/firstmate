@@ -58,7 +58,8 @@ PY
 #                  its undelivered and delivered-unacked counts
 #                  NATS_FAKE_HANG=1 models a broker that accepts the connection
 #                  and never answers
-#   stream info    reports the stored sequence range
+#   stream info    describes only a stream the registry stands up: its subject
+#                  set and its stored sequence range
 #   stream get     returns one stored message, base64 body included
 make_nats_stub() {  # <dir>
   local fb="$1/fakebin"
@@ -160,8 +161,21 @@ case "${args[0]:-}" in
     done
     case "${args[1]:-}" in
       info)
-        printf '{"config":{"name":"%s"},"state":{"messages":%s,"first_seq":1,"last_seq":%s}}\n' \
-          "${args[2]:-}" "$(stored)" "$(stored)"
+        subjects=
+        if [ -f "$store/subjects" ]; then
+          while read -r sname prefix; do
+            [ -n "$prefix" ] || continue
+            [ "$sname" = "${args[2]:-}" ] || continue
+            [ -z "$subjects" ] || subjects="$subjects,"
+            subjects="$subjects\"$prefix>\""
+          done <"$store/subjects"
+        fi
+        if [ -z "$subjects" ]; then
+          printf 'nats: error: stream not found\n' >&2
+          exit 1
+        fi
+        printf '{"config":{"name":"%s","subjects":[%s]},"state":{"messages":%s,"first_seq":1,"last_seq":%s}}\n' \
+          "${args[2]:-}" "$subjects" "$(stored)" "$(stored)"
         exit 0 ;;
       get)
         msg="$store/msgs/$(printf '%04d' "${args[3]:-0}")"
@@ -347,7 +361,7 @@ test_stream_required() {
 test_put_publishes_the_full_envelope() {
   local dir out msg
   dir=$(setup_overlay_dir put-envelope)
-  out=$(printf 'steer body\nline 2' | steer "$dir" put --stream firstmate --task t1 --seq 3)
+  out=$(steer "$dir" put --stream firstmate --task t1 --seq 3 --body $'steer body\nline 2')
   assert_contains "$out" "stream=firstmate" "put should name the stream"
   assert_contains "$out" "subject=firstmate.steer.t1" "put should use firstmate.steer.<task>"
   msg=$(published "$dir" 1) || fail "put published nothing"
@@ -374,7 +388,7 @@ test_put_sends_the_body_bytes_unchanged() {
   pass "fm-steer: put publishes the steer body byte for byte"
 }
 
-test_put_fails_when_another_stream_stored_the_steer() {
+test_put_refuses_when_the_named_stream_is_not_the_steers_stream() {
   local dir err out rc
   dir=$(setup_overlay_dir wrong-stream)
   err="$dir/err"
@@ -383,10 +397,12 @@ test_put_fails_when_another_stream_stored_the_steer() {
   out=$(steer "$dir" put --stream firstmate --task t1 --seq 1 --body "please rebase" 2>"$err")
   rc=$?
   set -e
-  expect_code 1 "$rc" "a steer stored by another stream must not report success"
-  assert_not_contains "$out" "put:" "no success line may claim a stream that did not store the steer"
+  expect_code 1 "$rc" "a steer another stream would store must not report success"
+  assert_not_contains "$out" "put:" "no success line may claim a stream that does not hold the steer"
   assert_contains "$(cat "$err")" "firstmate" "the failure should name the stream that was asked for"
-  pass "fm-steer: put fails when the acknowledging stream is not --stream"
+  [ "$(published_count "$dir")" = 0 ] \
+    || fail "a steer must not be published before the named stream is known to capture it"
+  pass "fm-steer: put refuses before publishing when --stream is not the steer's stream"
 }
 
 test_put_refuses_a_nats_cli_that_rewrites_bodies() {
@@ -485,6 +501,12 @@ test_put_requires_the_contract_fields() {
   set -e
   expect_code 2 "$rc" "a put with no seq must refuse"
   assert_contains "$(cat "$err")" "--seq" "the refusal should name --seq"
+  set +e
+  printf 'from stdin' | steer "$dir" put --stream firstmate --task t1 --seq 1 >/dev/null 2>"$err"
+  rc=$?
+  set -e
+  expect_code 2 "$rc" "put takes its body from --body, never from stdin"
+  assert_contains "$(cat "$err")" "--body" "the refusal should name --body"
   [ "$(published_count "$dir")" = 0 ] || fail "a refused put must publish nothing"
   pass "fm-steer: put refuses an envelope it cannot complete"
 }
@@ -835,6 +857,21 @@ test_send_idempotent_resend_republishes_the_mirror() {
   pass "fm-send: a deduplicated resend still republishes the JetStream mirror"
 }
 
+test_send_overlay_opt_in_is_exactly_on() {
+  local dir
+  dir=$(setup_overlay_dir send-optin)
+  make_tmux_stubs "$dir"
+  fm_write_meta "$dir/home/state/t1.meta" "window=sess:fm-t1" "kind=ship" "harness=claude"
+  printf 'true\n' >"$dir/home/config/carverauto-overlay"
+  printf 'firstmate\n' >"$dir/home/config/carverauto-inbox-stream"
+  : >"$dir/send.log"
+  run_send "$dir" t1 "ordinary steer" >/dev/null
+  [ -f "$dir/home/state/t1.inbox/001.msg" ] || fail "the disk inbox must still be written"
+  [ "$(published_count "$dir")" = 0 ] \
+    || fail "only an exact 'on' opts this home into the overlay"
+  pass "fm-send: the overlay opt-in is exactly on"
+}
+
 test_send_without_overlay_skips_dual_write() {
   local dir
   dir=$(setup_overlay_dir send-plain)
@@ -851,7 +888,7 @@ test_stream_required
 test_put_publishes_the_full_envelope
 test_put_sends_the_body_bytes_unchanged
 test_put_fails_when_no_stream_stored_the_steer
-test_put_fails_when_another_stream_stored_the_steer
+test_put_refuses_when_the_named_stream_is_not_the_steers_stream
 test_put_refuses_a_nats_cli_that_rewrites_bodies
 test_nats_url_must_not_carry_credentials
 test_nats_url_env_is_left_to_the_nats_cli
@@ -874,4 +911,5 @@ test_send_rings_the_doorbell_before_the_dual_write
 test_send_dual_write_is_bounded
 test_send_dual_write_reports_a_steer_that_did_not_land
 test_send_idempotent_resend_republishes_the_mirror
+test_send_overlay_opt_in_is_exactly_on
 test_send_without_overlay_skips_dual_write
