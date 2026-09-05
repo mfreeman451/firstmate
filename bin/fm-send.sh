@@ -47,7 +47,11 @@
 # watcher re-ringing an unacknowledged message and escalating a stuck one. An
 # explicit fire-and-forget record is excluded from that ladder.
 # bin/fm-task-inbox-lib.sh owns the record format, the doorbell line, and the
-# re-ring ladder. The composer pre-check before the ring is ADVISORY only: when
+# re-ring ladder.
+# On this Carverauto fork, an enabled overlay may dual-write the same body
+# through bin/fm-steer.sh after that on-disk enqueue; the disk inbox is
+# never skipped or deleted (carverauto-overlay skill).
+# The composer pre-check before the ring is ADVISORY only: when
 # the composer visibly holds pending text the ring is skipped with a notice and
 # the watcher re-rings an ordinary record later; no composer verdict is
 # delivery proof on this plane, and a failed ring never fails the send.
@@ -243,6 +247,8 @@ fi
 . "$SCRIPT_DIR/fm-task-inbox-lib.sh"
 # shellcheck source=bin/fm-timeout-lib.sh
 . "$SCRIPT_DIR/fm-timeout-lib.sh"
+# shellcheck source=bin/fm-carverauto-lib.sh
+. "$SCRIPT_DIR/fm-carverauto-lib.sh"
 
 FM_GUARD_CONTINUE_LINE='This is a supervision warning only; the requested message WILL still be sent.' "$SCRIPT_DIR/fm-guard.sh" || true
 
@@ -972,6 +978,9 @@ else
       exit 1
     fi
     fm_lock_release "$INBOX_META_LOCK"
+    # Additive overlay only: a failed or skipped JetStream put never undoes
+    # the on-disk record and never fails this send.
+    fm_carverauto_inbox_dual_write "$INBOX_TASK_ID" "$INBOX_RECORD" || true
     # Enqueue IS durable delivery to the task's record: mark the pending
     # expectation delivered now, without resolving it - only a correlated
     # parent report acknowledges the request.

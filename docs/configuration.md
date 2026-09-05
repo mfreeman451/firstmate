@@ -483,6 +483,33 @@ The sweep must finish inside `FM_CHECK_TIMEOUT` (default 30), because a run the 
 So a budget larger than that timeout allows is cut down to what fits instead of being refused, and the cut is reported in the report line.
 A budget that is not a whole number from 1 to 120 is still refused outright.
 
+## Carverauto overlay
+
+This fork's Discord, JetStream inbox, and portal wiring.
+It is not part of upstream firstmate.
+The `carverauto-overlay` skill owns when firstmate pages Discord, dual-writes a steer, or publishes a portal assignment.
+Script headers own exact flags.
+
+Opt in with gitignored `config/carverauto-overlay` containing `on`, or `FM_CARVERAUTO_OVERLAY=on`.
+Absent means inert: `fm-send` keeps the on-disk steering inbox and does not dual-write.
+This overlay is not inherited by secondmate homes.
+
+Gitignored leaves, each overridable by the matching environment variable:
+
+- `config/carverauto-notify-py` / `FM_CARVERAUTO_NOTIFY_PY` - path to firstmate-notify's `notify.py` (default `~/src/firstmate-notify/notify.py`)
+- `config/carverauto-nats-url` / `FM_CARVERAUTO_NATS_URL` or `NATS_URL` - NATS server URL for the `nats` CLI
+- `config/carverauto-inbox-stream` / `FM_CARVERAUTO_INBOX_STREAM` - JetStream stream `fm-send` dual-writes to
+- `config/carverauto-inbox-backend` / `FM_CARVERAUTO_INBOX_BACKEND` - `file` or `nats` (file is the default without a NATS URL)
+- `config/carverauto-portal-url` / `FM_CARVERAUTO_PORTAL_URL` - fleet portal, default `https://firstmate.carverauto.dev`
+
+The Discord webhook stays in firstmate-notify's gitignored `.env` as `DISCORD_WEBHOOK_URL`.
+NATS credentials stay in the `nats` CLI environment (`NATS_USER`, `NATS_PASSWORD`, `NATS_CREDS`).
+Never commit those values.
+
+`bin/fm-steer.sh` is the OpenSpec CLI (`put`/`next`/`ack`/`list`, required `--stream`, subject `firstmate.steer.<task>`, payload `fm-task-inbox.v1`).
+It never deletes a task's on-disk inbox under `state/<id>.inbox/`.
+Dual-write is additive only.
+
 ## Relay (.env)
 
 Relay lets a firstmate instance answer public mentions and act on normal reversible mention requests through firstmate's normal lifecycle.
