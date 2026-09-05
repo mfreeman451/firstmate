@@ -189,6 +189,7 @@ case "${args[0]:-}" in
   consumer)
     case "${args[1]:-}" in
       next)
+        raw=0
         ack=0
         nak=0
         i=4
@@ -199,7 +200,7 @@ case "${args[0]:-}" in
             --ack) ack=1 ;;
             --no-ack) ack=0 ;;
             --nak) nak=1 ;;
-            --raw|-r) : ;;
+            --raw|-r) raw=1 ;;
             -*) reject "${a%%=*}" ;;
           esac
           i=$((i + 1))
@@ -210,6 +211,10 @@ case "${args[0]:-}" in
         fi
         [ -f "$store/msgs/$(printf '%04d' "$head").body" ] \
           || { printf 'nats: no message\n' >&2; exit 1; }
+        if [ "$raw" = 0 ]; then
+          printf '[12:00:00] subj: %s / tries: 1 / cons seq: %s / str seq: %s / pending: %s\n\n' \
+            "$(cat "$store/msgs/$(printf '%04d' "$head").subject")" "$head" "$head" "$(( $(stored) - head ))"
+        fi
         cat "$store/msgs/$(printf '%04d' "$head").body"
         printf '\n'
         printf '%s' "$head" >"$store/delivered"
@@ -220,6 +225,14 @@ case "${args[0]:-}" in
           printf '%s' "$head" >"$store/nak"
         else
           printf '0' >"$store/nak"
+        fi
+        if [ "${NATS_FAKE_PAUSE_NEXT:-0}" = 1 ]; then
+          touch "$store/next-paused"
+          for ((attempt=0; attempt<500; attempt++)); do
+            [ -f "$store/next-release" ] && break
+            /bin/sleep 0.01
+          done
+          [ -f "$store/next-release" ] || exit 1
         fi
         exit 0 ;;
       info)
@@ -603,6 +616,34 @@ test_overlapping_ack_retries_preserve_unread_steer() {
   pass "fm-steer: overlapping ack retries preserve the unread steer"
 }
 
+test_next_identity_survives_overlapping_delivery() {
+  local dir first seq attempt body
+  dir=$(setup_overlay_dir next-overlap)
+  steer "$dir" put --stream firstmate --task t1 --seq 1 --body "first steer" >/dev/null
+  steer "$dir" put --stream firstmate --task t2 --seq 1 --body "unread steer" >/dev/null
+  NATS_FAKE_PAUSE_NEXT=1 steer "$dir" next --stream firstmate >"$dir/first" &
+  first=$!
+  for ((attempt=0; attempt<500; attempt++)); do
+    [ -f "$dir/nats/next-paused" ] && break
+    /bin/sleep 0.01
+  done
+  [ -f "$dir/nats/next-paused" ] || fail "first delivery never paused"
+  seq=$(steer "$dir" next --stream firstmate | reported_stream_seq)
+  steer "$dir" ack --stream firstmate --stream-seq "$seq" >/dev/null
+  steer "$dir" next --stream firstmate >/dev/null
+  touch "$dir/nats/next-release"
+  wait "$first" || fail "first next failed"
+  seq=$(reported_stream_seq <"$dir/first")
+  [ "$seq" = 1 ] || fail "first body was labelled with another delivery: $seq"
+  body=$(after_separator <"$dir/first" | after_separator)
+  [ "$body" = "first steer" ] || fail "first delivery returned another body: $body"
+  steer "$dir" ack --stream firstmate --stream-seq "$seq" >/dev/null
+  [ "$(pending_count "$dir" firstmate)" = 1 ] || fail "ack consumed the unread steer"
+  body=$(steer "$dir" next --stream firstmate | after_separator | after_separator)
+  [ "$body" = "unread steer" ] || fail "unread steer was lost: $body"
+  pass "fm-steer: next identity stays bound to its delivery during overlap"
+}
+
 test_ack_refuses_another_sequence() {
   local dir err rc
   dir=$(setup_overlay_dir ack-guard)
@@ -959,6 +1000,7 @@ test_steer_has_no_contract_escape_hatches
 test_next_peeks_and_ack_handles_that_steer
 test_repeated_ack_never_handles_an_unread_steer
 test_overlapping_ack_retries_preserve_unread_steer
+test_next_identity_survives_overlapping_delivery
 test_ack_refuses_another_sequence
 test_list_enumerates_the_pending_steers
 test_list_bounds_the_steers_it_describes

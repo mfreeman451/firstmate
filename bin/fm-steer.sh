@@ -195,14 +195,27 @@ cmd_put() {
 }
 
 cmd_next() {
-  local body state delivered
-  body=$(fm_carverauto_nats_run consumer next "$STREAM" "$STREAM" --count 1 --no-ack --nak --raw) \
+  local delivery delivered message
+  delivery=$(fm_carverauto_nats_run consumer next "$STREAM" "$STREAM" --count 1 --no-ack --nak) \
     || fail "no pending steer on stream $STREAM"
-  state=$(consumer_state)
-  read -r _ _ delivered _ <<<"$state"
-  printf 'next: stream=%s stream-seq=%s\n' "$STREAM" "$delivered"
-  printf -- '--\n'
-  printf '%s\n' "$body"
+  delivered=$(printf '%s' "$delivery" | python3 -c 'import re, sys
+header = sys.stdin.readline().rstrip("\n")
+match = re.fullmatch(r"\[\d{2}:\d{2}:\d{2}\] subj: \S+ / tries: \d+ / cons seq: \d+ / str seq: ([1-9][0-9]*) / pending: \S+", header)
+if not match:
+    sys.exit(1)
+print(match[1])') \
+    || fail "nats consumer next returned unrecognized delivery metadata"
+  message=$(fm_carverauto_nats_run stream get "$STREAM" "$delivered" --json) \
+    || fail "could not read delivered stream-seq $delivered on stream $STREAM"
+  printf '%s' "$message" | python3 -c 'import base64, json, sys
+message = json.load(sys.stdin)
+if message["seq"] != int(sys.argv[2]):
+    sys.exit(1)
+body = base64.b64decode(message["data"], validate=True).decode("utf-8")
+print("next: stream=%s stream-seq=%s" % (sys.argv[1], sys.argv[2]))
+print("--")
+sys.stdout.write(body.rstrip("\n") + "\n")' "$STREAM" "$delivered" \
+    || fail "invalid stored message for delivered stream-seq $delivered"
 }
 
 cmd_ack() {
