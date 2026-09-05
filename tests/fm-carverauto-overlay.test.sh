@@ -305,7 +305,7 @@ published() {  # <dir> <n>
 }
 
 published_count() {  # <dir>
-  ls -1 "$1/nats/msgs"/*.body 2>/dev/null | wc -l | tr -d ' '
+  find "$1/nats/msgs" -maxdepth 1 -type f -name '*.body' 2>/dev/null | wc -l | tr -d ' '
 }
 
 # Everything after the first "--" line: the envelope out of a next report, or
@@ -863,7 +863,7 @@ test_send_idempotent_resend_republishes_the_mirror() {
     || fail "the first fire-and-forget send failed"
   run_send "$dir" s1 --fire-and-forget "$delivery" "reconcile your own books" >/dev/null \
     || fail "the fire-and-forget retry failed"
-  [ "$(ls -1 "$dir/home/state/s1.inbox"/*.msg | wc -l | tr -d ' ')" = 1 ] \
+  [ "$(find "$dir/home/state/s1.inbox" -maxdepth 1 -type f -name '*.msg' | wc -l | tr -d ' ')" = 1 ] \
     || fail "the retry duplicated the on-disk record"
   [ "$(published_count "$dir")" = 2 ] \
     || fail "the retry must republish the mirror rather than silently skip it"
