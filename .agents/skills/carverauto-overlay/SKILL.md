@@ -17,6 +17,7 @@ This is this fork's operator overlay for Carverauto.
 It is not upstream firstmate.
 `bin/fm-carverauto-notify.sh`, `bin/fm-steer.sh`, and `bin/fm-carverauto-portal.sh` own exact flags.
 [`docs/configuration.md`](../../../docs/configuration.md#carverauto-overlay) owns opt-in files and environment.
+The `config/carverauto-overlay` opt-in governs `fm-send`'s dual-write only; paging Discord and publishing an assignment are direct calls this skill owns.
 
 Do not put a Discord webhook, bot token, NATS password, or `GITHUB_TOKEN` in git, in this skill, or in chat.
 

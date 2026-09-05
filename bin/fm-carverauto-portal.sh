@@ -18,8 +18,9 @@
 # captures fails the assign; that needs natscli 0.4.0 or newer.
 #
 # Default portal_url: https://firstmate.carverauto.dev
-# bin/fm-carverauto-lib.sh owns overlay opt-in, URL resolution, and the nats
-# invocation. The carverauto-overlay skill owns when firstmate must publish.
+# bin/fm-carverauto-lib.sh owns URL resolution and the nats invocation. The
+# config/carverauto-overlay opt-in governs fm-send's dual-write only, not this
+# publisher. The carverauto-overlay skill owns when firstmate must publish.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -123,5 +124,5 @@ PY
 
 SUBJECT="firstmate.assign.${TASK_ID}"
 fm_carverauto_nats_publish "$SUBJECT" "$PAYLOAD" >&2 \
-  || { printf 'error: nats publish to %s failed\n' "$SUBJECT" >&2; exit 1; }
+  || { printf 'error: nats publish to %s failed; the overlay needs natscli 0.4.0 or newer, whose --templates=false keeps a payload byte for byte\n' "$SUBJECT" >&2; exit 1; }
 printf 'assign: subject=%s task=%s worker=%s\n' "$SUBJECT" "$TASK_ID" "$WORKER"

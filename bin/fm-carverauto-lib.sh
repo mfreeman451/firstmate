@@ -141,19 +141,9 @@ fm_carverauto_nats_run() {  # <nats-args...>
 # only the JetStream acknowledgement proves a stream stored the message.
 # natscli also expands Go templates ({{Count}}, {{ID}}, {{Time}}, ...) in a
 # publish body unless --templates=false is passed, and that flag exists only
-# from natscli 0.4.0. A CLI without it cannot carry a body byte for byte, so the
-# overlay refuses up front instead of publishing something other than what the
-# caller handed it.
+# from natscli 0.4.0. A CLI without it refuses that flag at parse time, before
+# connecting, so an old CLI fails closed on its own and nothing is published.
 fm_carverauto_nats_publish() {  # <subject> <payload>
-  local help
-  help=$(fm_carverauto_nats_run publish --help) || return 1
-  case "$help" in
-    *'--[no-]templates'*) ;;
-    *)
-      echo "error: this nats CLI expands Go templates in a published body and cannot be told not to; the Carverauto overlay needs natscli 0.4.0 or newer, which accepts --templates=false" >&2
-      return 1
-      ;;
-  esac
   fm_carverauto_nats_run publish -J --templates=false "$1" -- "$2"
 }
 

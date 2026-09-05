@@ -191,7 +191,7 @@ cmd_put() {
   fi
   payload="${payload}--"$'\n'"$BODY_ARG"
   fm_carverauto_nats_publish "$subject" "$payload" >&2 \
-    || fail "nats publish to $subject failed"
+    || fail "nats publish to $subject failed; the overlay needs natscli 0.4.0 or newer, whose --templates=false keeps a steer body byte for byte"
   printf 'put: stream=%s subject=%s seq=%s\n' "$STREAM" "$subject" "$SEQ_ARG"
 }
 
@@ -232,6 +232,11 @@ print(int(json.load(sys.stdin).get("state", {}).get("last_seq", 0)))' \
     || fail "nats stream info did not describe stream $STREAM"
 }
 
+# At most this many steers are described per list. Each one costs a broker
+# round trip, and nothing in this fork acks, so the pending set only grows;
+# the count in the header stays exact while the enumeration stays bounded.
+LIST_MAX_STEERS=10
+
 # One stored steer, as "subject=<s> task=<t> seq=<n>". Reading the stream does
 # not touch the durable consumer, so listing never handles or redelivers a steer.
 stream_message() {  # <stream-seq>
@@ -255,7 +260,7 @@ print("subject=%s task=%s seq=%s"
 # stream's retained history. Each pending steer is listed by the same
 # stream-seq that ack takes, walking the stream above the consumer's ack floor.
 cmd_list() {
-  local state pending ackpending floor total last seq shown line
+  local state pending ackpending floor total last seq shown unreadable line
   state=$(consumer_state)
   read -r pending ackpending _ floor <<<"$state"
   total=$((pending + ackpending))
@@ -263,14 +268,22 @@ cmd_list() {
   [ "$total" -gt 0 ] || return 0
   last=$(stream_last_seq)
   shown=0
+  unreadable=0
   seq=$((floor + 1))
-  while [ "$shown" -lt "$total" ] && [ "$seq" -le "$last" ]; do
+  while [ "$((shown + unreadable))" -lt "$total" ] \
+    && [ "$shown" -lt "$LIST_MAX_STEERS" ] \
+    && [ "$seq" -le "$last" ]; do
     if line=$(stream_message "$seq"); then
       printf 'stream-seq=%s %s\n' "$seq" "$line"
       shown=$((shown + 1))
+    else
+      unreadable=$((unreadable + 1))
     fi
     seq=$((seq + 1))
   done
+  [ "$unreadable" -eq 0 ] || printf 'unreadable=%s\n' "$unreadable"
+  [ "$((shown + unreadable))" -ge "$total" ] \
+    || printf 'listed=%s more=%s\n' "$shown" "$((total - shown - unreadable))"
 }
 
 case "$CMD" in

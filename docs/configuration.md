@@ -491,8 +491,9 @@ The `carverauto-overlay` skill owns when firstmate pages Discord, dual-writes a 
 Script headers own exact flags.
 
 Opt in with gitignored `config/carverauto-overlay` containing exactly `on`, or `FM_CARVERAUTO_OVERLAY=on` (`1` also works for the environment override).
-Any other value, including absent, leaves the overlay off.
-Absent means inert: `fm-send` keeps the on-disk steering inbox and does not dual-write.
+Any other value, including absent, leaves it off.
+That switch governs `fm-send`'s dual-write and nothing else: off means `fm-send` keeps the on-disk steering inbox and does not mirror it to JetStream.
+Paging Discord (`fm-carverauto-notify.sh`) and publishing a portal assignment (`fm-carverauto-portal.sh`) are direct calls that run whatever it says, so a captain-attention page is never silently swallowed; the `carverauto-overlay` skill owns when firstmate makes them.
 This overlay is not inherited by secondmate homes.
 
 Gitignored leaves, each overridable by the matching environment variable:

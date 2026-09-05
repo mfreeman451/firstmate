@@ -51,7 +51,7 @@ PY
 #                  JetStream acknowledgement would. Like natscli it expands
 #                  {{Count}} in the body unless the publisher passed
 #                  --templates=false; NATS_FAKE_TEMPLATES=0 models a natscli
-#                  older than 0.4.0, which has no such flag at all
+#                  older than 0.4.0, which rejects that flag at parse time
 #   consumer next  serves the head of the one durable consumer: --nak leaves it
 #                  pending and first in line, --ack advances the ack floor
 #   consumer info  reports that consumer's delivered/ack_floor sequences and
@@ -98,17 +98,6 @@ case "${args[0]:-}" in
     while [ "$i" -lt "${#args[@]}" ]; do
       a=${args[$i]}
       case "$a" in
-        --help)
-          printf 'usage: nats publish [<flags>] <subject> [<body>]\n\nFlags:\n'
-          printf '      --reply=REPLY        Sets a custom reply to subject\n'
-          printf '  -H, --header=HEADER ...  Adds headers to the message\n'
-          printf '      --count=1            Publish multiple messages\n'
-          printf '      --force-stdin        Force reading from stdin\n'
-          printf '  -J, --jetstream          Publish messages to jetstream\n'
-          if [ "$templates" = 1 ]; then
-            printf '      --[no-]templates     Enables template functions in the body and subject\n'
-          fi
-          exit 0 ;;
         -J|--jetstream) js=1 ;;
         --templates=false)
           [ "$templates" = 1 ] || reject --templates
@@ -418,9 +407,6 @@ test_put_refuses_a_nats_cli_that_rewrites_bodies() {
   assert_contains "$(cat "$err")" "natscli 0.4.0" "the refusal should name the CLI the overlay needs"
   [ "$(published_count "$dir")" = 0 ] \
     || fail "nothing may be published through a CLI that rewrites bodies"
-  log=$(cat "$dir/nats/argv.log" 2>/dev/null || printf '')
-  assert_not_contains "$log" "--templates=false" \
-    "the preflight must refuse before handing the CLI a flag it does not have"
   pass "fm-steer: put refuses a nats CLI that would expand a steer body"
 }
 
@@ -612,6 +598,24 @@ test_list_enumerates_the_pending_steers() {
   assert_not_contains "$listed" "task=t1" "a handled steer must not be listed as pending"
   assert_contains "$listed" "task=t2" "the remaining steers should still be listed"
   pass "fm-steer: list enumerates the pending steers, not just how many"
+}
+
+test_list_bounds_the_steers_it_describes() {
+  local dir listed described i
+  dir=$(setup_overlay_dir list-bounded)
+  i=1
+  while [ "$i" -le 12 ]; do
+    steer "$dir" put --stream firstmate --task "t$i" --seq 1 --body "steer $i" >/dev/null
+    i=$((i + 1))
+  done
+  listed=$(steer "$dir" list --stream firstmate)
+  assert_contains "$listed" "pending=12" "the pending count stays exact however many are described"
+  described=$(printf '%s\n' "$listed" | grep -c '^stream-seq=')
+  [ "$described" = 10 ] \
+    || fail "list described $described steers; the enumeration must stay bounded"
+  assert_contains "$listed" "listed=10 more=2" \
+    "list should report the pending steers it did not describe"
+  pass "fm-steer: list bounds the steers it describes and reports the remainder"
 }
 
 test_inbox_does_not_touch_task_disk_inbox() {
@@ -908,6 +912,7 @@ test_next_peeks_and_ack_handles_that_steer
 test_repeated_ack_never_handles_an_unread_steer
 test_ack_refuses_another_sequence
 test_list_enumerates_the_pending_steers
+test_list_bounds_the_steers_it_describes
 test_inbox_does_not_touch_task_disk_inbox
 test_notify_captain_needed_includes_portal_and_hides_token
 test_notify_portal_url_cannot_be_suppressed

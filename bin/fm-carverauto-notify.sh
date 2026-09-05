@@ -15,7 +15,9 @@
 #
 # Resolve notify.py from FM_CARVERAUTO_NOTIFY_PY, then
 # config/carverauto-notify-py, then ~/src/firstmate-notify/notify.py.
-# bin/fm-carverauto-lib.sh owns overlay opt-in and portal URL resolution.
+# bin/fm-carverauto-lib.sh owns portal URL resolution. The
+# config/carverauto-overlay opt-in governs fm-send's dual-write only: a
+# captain-attention page is never silently swallowed by it.
 # The carverauto-overlay skill owns when firstmate must call this.
 set -euo pipefail
 
