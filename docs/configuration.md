@@ -513,7 +513,7 @@ JetStream is its only store: it needs natscli 0.4.0 or newer, whose `--templates
 `next`, `ack`, and `list` address a durable pull consumer named after the stream, with `AckPolicy=explicit`; create it with `nats consumer add` before using them, because the overlay never provisions it.
 A portal assignment is a separate family on `firstmate.assign.<task>` with its own publisher.
 `bin/fm-steer.sh` never deletes a task's on-disk inbox under `state/<id>.inbox/`.
-Dual-write is additive only: it runs after the doorbell rings, is bounded so an unreachable broker cannot delay a steer, and a dual-write that cannot reach NATS is a notice, never a failed steer.
+Dual-write is additive only: it runs after the doorbell rings, is bounded by `FM_CARVERAUTO_DUAL_WRITE_BUDGET_SECS` (default 10 seconds) so an unreachable broker cannot delay a steer, and a dual-write that cannot reach NATS is a notice, never a failed steer.
 A re-run that deduplicates onto an existing on-disk record publishes again, so the JetStream mirror is at-least-once.
 
 ## Relay (.env)

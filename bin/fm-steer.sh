@@ -3,7 +3,7 @@
 # command name firstmate-notify's portal change owns.
 #
 # Usage:
-#   fm-steer.sh put  --stream <name> --task <id> --seq <n> [--body <text>] [--delivery fire-and-forget]
+#   fm-steer.sh put  --stream <name> --task <id> --seq <n> --body <text> [--delivery fire-and-forget]
 #   fm-steer.sh next --stream <name>
 #   fm-steer.sh ack  --stream <name> --stream-seq <n>
 #   fm-steer.sh list --stream <name>
