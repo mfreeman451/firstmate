@@ -133,6 +133,10 @@
       "audience": "agent-runtime"
     },
     {
+      "path": ".agents/skills/carverauto-overlay/SKILL.md",
+      "audience": "agent-runtime"
+    },
+    {
       "path": ".agents/skills/decision-hold-lifecycle/SKILL.md",
       "audience": "agent-runtime"
     },
@@ -258,7 +262,11 @@
     },
     {
       "path": "GROK_BOT.md",
-      "audience": "public-product"
+      "audience": "agent-runtime"
+    },
+    {
+      "path": "GROK_BOT_SECOND_MATE.md",
+      "audience": "agent-runtime"
     },
     {
       "path": "README.md",

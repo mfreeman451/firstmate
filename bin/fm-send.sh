@@ -47,7 +47,12 @@
 # watcher re-ringing an unacknowledged message and escalating a stuck one. An
 # explicit fire-and-forget record is excluded from that ladder.
 # bin/fm-task-inbox-lib.sh owns the record format, the doorbell line, and the
-# re-ring ladder. The composer pre-check before the ring is ADVISORY only: when
+# re-ring ladder.
+# On this Carverauto fork, an enabled overlay may dual-write the same body
+# through bin/fm-steer.sh after that on-disk enqueue and after the doorbell
+# has rung, bounded so a sick broker never delays the ring; the disk inbox is
+# never skipped or deleted (carverauto-overlay skill).
+# The composer pre-check before the ring is ADVISORY only: when
 # the composer visibly holds pending text the ring is skipped with a notice and
 # the watcher re-rings an ordinary record later; no composer verdict is
 # delivery proof on this plane, and a failed ring never fails the send.
@@ -243,6 +248,8 @@ fi
 . "$SCRIPT_DIR/fm-task-inbox-lib.sh"
 # shellcheck source=bin/fm-timeout-lib.sh
 . "$SCRIPT_DIR/fm-timeout-lib.sh"
+# shellcheck source=bin/fm-carverauto-lib.sh
+. "$SCRIPT_DIR/fm-carverauto-lib.sh"
 
 FM_GUARD_CONTINUE_LINE='This is a supervision warning only; the requested message WILL still be sent.' "$SCRIPT_DIR/fm-guard.sh" || true
 
@@ -1009,6 +1016,11 @@ else
       1) echo "fm-send: doorbell skipped (composer visibly holds pending text); the steer is durably recorded at $INBOX_RECORD and the watcher will re-ring" >&2 ;;
       2) echo "fm-send: doorbell did not reach $T; the steer is durably recorded at $INBOX_RECORD and the watcher will re-ring" >&2 ;;
     esac
+    # Additive overlay only, and last: a failed JetStream put never undoes the
+    # on-disk record, never fails this send, and never delays the doorbell. A
+    # re-run that landed on an existing record publishes again, so the mirror
+    # is at-least-once rather than silently missing.
+    fm_carverauto_inbox_dual_write "$INBOX_TASK_ID" "$INBOX_RECORD" || true
     exit 0
   fi
   # Slash commands open a completion popup in some TUIs (verified on codex);

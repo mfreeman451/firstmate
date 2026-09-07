@@ -1,0 +1,307 @@
+#!/usr/bin/env bash
+# fm-steer - this fork's JetStream steering inbox for Carverauto, under the
+# command name firstmate-notify's portal change owns.
+#
+# Usage:
+#   fm-steer.sh put  --stream <name> --task <id> --seq <n> --body <text> [--delivery fire-and-forget]
+#   fm-steer.sh next --stream <name>
+#   fm-steer.sh ack  --stream <name> --stream-seq <n>
+#   fm-steer.sh list --stream <name>
+#
+# --stream is required on every command and names the durable consumer too.
+# The steer body for put is --body.
+#
+# Contract (OpenSpec add-firstmate-portal in firstmate-notify):
+#   put/next/ack/list, required --stream, subject firstmate.steer.<task>,
+#   ack = handled, list = pending, payload schema=fm-task-inbox.v1 with
+#   at, task, seq, body, and optional fire-and-forget.
+# The subject and the schema are pinned: this CLI publishes that family and
+# nothing else. A portal assignment is a different family with its own
+# publisher (bin/fm-carverauto-portal.sh), not an override here.
+#
+# JetStream is the only store. put first reads the named stream's own subject
+# set, so a --stream that does not capture firstmate.steer.<task> is refused
+# before anything is published; the publish itself is a JetStream publish, so
+# its acknowledgement proves the steer was actually stored. The body is
+# published unchanged, which needs natscli 0.4.0 or newer: older ones expand Go
+# templates such as {{Count}} in the body, so bin/fm-carverauto-lib.sh refuses
+# to publish through them rather than send a steer that differs from the
+# on-disk record.
+#
+# next, ack, and list address a durable PULL consumer named after the stream,
+# with AckPolicy=explicit. The overlay never creates it: `nats consumer add`
+# is the operator's step, and docs/configuration.md names it.
+#
+# next peeks the head of the durable consumer: the steer is delivered and
+# negative-acknowledged, so it stays pending and stays first in line, and next
+# reports the JetStream sequence that identifies it. ack takes that same
+# --stream-seq and refuses unless it is still the steer the consumer last
+# delivered, so a repeated or unpaired ack can never handle a steer nobody
+# read; acknowledging one that is already below the ack floor is reported as
+# already handled. list reports everything the consumer has not acknowledged.
+# The overlay keeps no message store of its own.
+#
+# This is the contract fm-send dual-writes to. It never deletes, moves, or
+# truncates a task's on-disk steering inbox (state/<id>.inbox/), which remains
+# the delivery record; this CLI has no path that removes it.
+#
+# bin/fm-carverauto-lib.sh owns overlay opt-in and the nats invocation, so
+# credentials stay in the nats CLI environment and never reach argv. The
+# carverauto-overlay skill owns when firstmate should dual-write. Do not
+# silently skip the on-disk inbox from fm-send: dual-write is additive only.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=bin/fm-carverauto-lib.sh
+. "$SCRIPT_DIR/fm-carverauto-lib.sh"
+
+die() { printf 'error: %s\n' "$1" >&2; exit 2; }
+fail() { printf 'error: %s\n' "$1" >&2; exit 1; }
+
+usage() {
+  awk '
+    NR == 1 { next }
+    /^#/ { sub(/^# ?/, ""); print; next }
+    { exit }
+  ' "${BASH_SOURCE[0]}"
+  exit 2
+}
+
+SCHEMA=fm-task-inbox.v1
+CMD=
+STREAM=
+TASK_ID=
+SEQ_ARG=
+STREAM_SEQ=
+DELIVERY=
+BODY_ARG=
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -h|--help|help) usage ;;
+    put|next|ack|list)
+      [ -z "$CMD" ] || die "multiple commands"
+      CMD=$1
+      shift
+      ;;
+    --stream)
+      [ -n "${2-}" ] || die "--stream needs a name"
+      STREAM=$2
+      shift 2
+      ;;
+    --task)
+      [ -n "${2-}" ] || die "--task needs an id"
+      TASK_ID=$2
+      shift 2
+      ;;
+    --seq)
+      [ -n "${2-}" ] || die "--seq needs a number"
+      SEQ_ARG=$2
+      shift 2
+      ;;
+    --stream-seq)
+      [ -n "${2-}" ] || die "--stream-seq needs a number"
+      STREAM_SEQ=$2
+      shift 2
+      ;;
+    --delivery)
+      [ -n "${2-}" ] || die "--delivery needs a value"
+      [ "$2" = fire-and-forget ] || die "--delivery must be fire-and-forget"
+      DELIVERY=$2
+      shift 2
+      ;;
+    --body)
+      [ -n "${2-}" ] || die "--body needs a value"
+      BODY_ARG=$2
+      shift 2
+      ;;
+    --) shift; break ;;
+    -*) die "unknown option: $1" ;;
+    *) die "unexpected argument: $1" ;;
+  esac
+done
+
+[ -n "$CMD" ] || die "command required: put, next, ack, or list"
+[ -n "$STREAM" ] || die "--stream is required"
+fm_carverauto_valid_token "$STREAM" || die "invalid --stream (use a NATS-safe token, no path separators)"
+
+# The named stream's own description. Every command that names a stream proves
+# it exists through this, so a stream that is not there is a refusal rather
+# than a message stored somewhere the operator was never told about.
+stream_info() {
+  local info
+  command -v python3 >/dev/null 2>&1 \
+    || fail "python3 is required to read the stream description"
+  info=$(fm_carverauto_nats_run stream info "$STREAM" --json) \
+    || fail "nats stream info failed for stream $STREAM; create it before using this inbox"
+  printf '%s' "$info"
+}
+
+# Whether the stream's configured subject set captures this subject, by the
+# same token rules NATS applies: * matches one token, > the rest.
+stream_captures() {  # <stream-info-json> <subject>
+  printf '%s' "$1" | python3 -c 'import json, sys
+subject = sys.argv[1].split(".")
+
+def matches(subject_filter):
+    tokens = subject_filter.split(".")
+    for i, token in enumerate(tokens):
+        if token == ">":
+            return i < len(subject)
+        if i >= len(subject) or (token != "*" and token != subject[i]):
+            return False
+    return len(tokens) == len(subject)
+
+subjects = json.load(sys.stdin).get("config", {}).get("subjects", [])
+sys.exit(0 if any(matches(s) for s in subjects) else 1)' "$2"
+}
+
+consumer_state() {
+  local info
+  command -v python3 >/dev/null 2>&1 \
+    || fail "python3 is required to read the durable consumer state"
+  info=$(fm_carverauto_nats_run consumer info "$STREAM" "$STREAM" --json) \
+    || fail "nats consumer info failed for consumer $STREAM on stream $STREAM"
+  printf '%s' "$info" | python3 -c 'import json, sys
+d = json.load(sys.stdin)
+print(int(d.get("num_pending", 0)),
+      int(d.get("num_ack_pending", 0)),
+      int(d.get("delivered", {}).get("stream_seq", 0)),
+      int(d.get("ack_floor", {}).get("stream_seq", 0)),
+      int(d.get("delivered", {}).get("consumer_seq", 0)))' \
+    || fail "nats consumer info did not describe consumer $STREAM on stream $STREAM"
+}
+
+cmd_put() {
+  local payload subject
+  [ -n "$TASK_ID" ] || die "put requires --task (the subject is firstmate.steer.<task>)"
+  fm_carverauto_valid_token "$TASK_ID" || die "invalid --task (use a NATS-safe token, no path separators)"
+  [ -n "$SEQ_ARG" ] || die "put requires --seq (the fm-task-inbox.v1 record sequence)"
+  case "$SEQ_ARG" in
+    *[!0-9]*) die "--seq must be a number" ;;
+  esac
+  [ -n "$BODY_ARG" ] || die "put requires --body"
+  subject="firstmate.steer.${TASK_ID}"
+  stream_captures "$(stream_info)" "$subject" \
+    || fail "stream $STREAM does not capture $subject; --stream and the stream holding this fork's steers disagree"
+  payload="schema=$SCHEMA"$'\n'"at=$(fm_carverauto_now)"$'\n'"task=$TASK_ID"$'\n'"seq=$SEQ_ARG"$'\n'
+  if [ "$DELIVERY" = fire-and-forget ]; then
+    payload="${payload}delivery=fire-and-forget"$'\n'
+  fi
+  payload="${payload}--"$'\n'"$BODY_ARG"
+  fm_carverauto_nats_publish "$subject" "$payload" >&2 \
+    || fail "nats publish to $subject failed; the overlay needs natscli 0.4.0 or newer, whose --templates=false keeps a steer body byte for byte"
+  printf 'put: stream=%s subject=%s seq=%s\n' "$STREAM" "$subject" "$SEQ_ARG"
+}
+
+cmd_next() {
+  local delivery delivered message
+  delivery=$(fm_carverauto_nats_run consumer next "$STREAM" "$STREAM" --count 1 --no-ack --nak) \
+    || fail "no pending steer on stream $STREAM"
+  delivered=$(printf '%s' "$delivery" | python3 -c 'import re, sys
+header = sys.stdin.readline().rstrip("\n")
+match = re.fullmatch(r"\[\d{2}:\d{2}:\d{2}\] subj: \S+ / tries: \d+ / cons seq: \d+ / str seq: ([1-9][0-9]*) / pending: \S+", header)
+if not match:
+    sys.exit(1)
+print(match[1])') \
+    || fail "nats consumer next returned unrecognized delivery metadata"
+  message=$(fm_carverauto_nats_run stream get "$STREAM" "$delivered" --json) \
+    || fail "could not read delivered stream-seq $delivered on stream $STREAM"
+  printf '%s' "$message" | python3 -c 'import base64, json, sys
+message = json.load(sys.stdin)
+if message["seq"] != int(sys.argv[2]):
+    sys.exit(1)
+body = base64.b64decode(message["data"], validate=True).decode("utf-8")
+print("next: stream=%s stream-seq=%s" % (sys.argv[1], sys.argv[2]))
+print("--")
+sys.stdout.write(body.rstrip("\n") + "\n")' "$STREAM" "$delivered" \
+    || fail "invalid stored message for delivered stream-seq $delivered"
+}
+
+cmd_ack() {
+  local state delivered floor consumer_seq ack_subject
+  [ -n "$STREAM_SEQ" ] || die "ack requires --stream-seq (the sequence next reported)"
+  case "$STREAM_SEQ" in
+    *[!0-9]*) die "--stream-seq must be a number" ;;
+  esac
+  state=$(consumer_state)
+  read -r _ _ delivered floor consumer_seq <<<"$state"
+  if [ "$STREAM_SEQ" -le "$floor" ]; then
+    printf 'ack: stream=%s stream-seq=%s already handled\n' "$STREAM" "$STREAM_SEQ"
+    return 0
+  fi
+  [ "$STREAM_SEQ" -eq "$delivered" ] \
+    || fail "stream-seq $STREAM_SEQ is not the steer consumer $STREAM last delivered ($delivered); run next first"
+  ack_subject="\$JS.ACK.$STREAM.$STREAM.1.$STREAM_SEQ.$consumer_seq.0.0"
+  fm_carverauto_nats_run request "$ack_subject" +ACK --raw >&2 \
+    || fail "nats could not acknowledge stream-seq $STREAM_SEQ on stream $STREAM"
+  printf 'ack: stream=%s stream-seq=%s handled\n' "$STREAM" "$STREAM_SEQ"
+}
+
+# The stream's highest sequence, which bounds the walk over pending steers.
+stream_last_seq() {
+  stream_info | python3 -c 'import json, sys
+print(int(json.load(sys.stdin).get("state", {}).get("last_seq", 0)))' \
+    || fail "nats stream info did not describe stream $STREAM"
+}
+
+# At most this many steers are described per list. Each one costs a broker
+# round trip, and nothing in this fork acks, so the pending set only grows;
+# the count in the header stays exact while the enumeration stays bounded.
+LIST_MAX_STEERS=10
+
+# One stored steer, as "subject=<s> task=<t> seq=<n>". Reading the stream does
+# not touch the durable consumer, so listing never handles or redelivers a steer.
+stream_message() {  # <stream-seq>
+  local raw
+  raw=$(fm_carverauto_nats_run stream get "$STREAM" "$1" --json 2>/dev/null) || return 1
+  printf '%s' "$raw" | python3 -c 'import base64, json, sys
+m = json.load(sys.stdin)
+fields = {}
+for line in base64.b64decode(m.get("data", "")).decode("utf-8", "replace").split("\n"):
+    if line == "--":
+        break
+    key, _, value = line.partition("=")
+    fields[key] = value
+print("subject=%s task=%s seq=%s"
+      % (m.get("subject", ""), fields.get("task", ""), fields.get("seq", "")))' \
+    || return 1
+}
+
+# Pending is everything the durable consumer has not acknowledged - both what
+# it has never delivered and what it has delivered without an ack - never the
+# stream's retained history. Each pending steer is listed by the same
+# stream-seq that ack takes, walking the stream above the consumer's ack floor.
+cmd_list() {
+  local state pending ackpending floor total last seq shown unreadable line
+  state=$(consumer_state)
+  read -r pending ackpending _ floor _ <<<"$state"
+  total=$((pending + ackpending))
+  printf 'stream=%s pending=%s\n' "$STREAM" "$total"
+  [ "$total" -gt 0 ] || return 0
+  last=$(stream_last_seq)
+  shown=0
+  unreadable=0
+  seq=$((floor + 1))
+  while [ "$((shown + unreadable))" -lt "$total" ] \
+    && [ "$shown" -lt "$LIST_MAX_STEERS" ] \
+    && [ "$seq" -le "$last" ]; do
+    if line=$(stream_message "$seq"); then
+      printf 'stream-seq=%s %s\n' "$seq" "$line"
+      shown=$((shown + 1))
+    else
+      unreadable=$((unreadable + 1))
+    fi
+    seq=$((seq + 1))
+  done
+  [ "$unreadable" -eq 0 ] || printf 'unreadable=%s\n' "$unreadable"
+  [ "$((shown + unreadable))" -ge "$total" ] \
+    || printf 'listed=%s more=%s\n' "$shown" "$((total - shown - unreadable))"
+}
+
+case "$CMD" in
+  put) cmd_put ;;
+  next) cmd_next ;;
+  ack) cmd_ack ;;
+  list) cmd_list ;;
+esac

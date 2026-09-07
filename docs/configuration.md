@@ -483,6 +483,39 @@ The sweep must finish inside `FM_CHECK_TIMEOUT` (default 30), because a run the 
 So a budget larger than that timeout allows is cut down to what fits instead of being refused, and the cut is reported in the report line.
 A budget that is not a whole number from 1 to 120 is still refused outright.
 
+## Carverauto overlay
+
+This fork's Discord, JetStream inbox, and portal wiring.
+It is not part of upstream firstmate.
+The `carverauto-overlay` skill owns when firstmate pages Discord, dual-writes a steer, or publishes a portal assignment.
+Script headers own exact flags.
+
+Opt in with gitignored `config/carverauto-overlay` containing exactly `on`, or `FM_CARVERAUTO_OVERLAY=on` (`1` also works for the environment override).
+Any other value, including absent, leaves it off.
+That switch governs `fm-send`'s dual-write and nothing else: off means `fm-send` keeps the on-disk steering inbox and does not mirror it to JetStream.
+Paging Discord (`fm-carverauto-notify.sh`) and publishing a portal assignment (`fm-carverauto-portal.sh`) are direct calls that run whatever it says, so a captain-attention page is never silently swallowed; the `carverauto-overlay` skill owns when firstmate makes them.
+This overlay is not inherited by secondmate homes.
+
+Gitignored leaves, each overridable by the matching environment variable:
+
+- `config/carverauto-notify-py` / `FM_CARVERAUTO_NOTIFY_PY` - path to firstmate-notify's `notify.py` (default `~/src/firstmate-notify/notify.py`)
+- `config/carverauto-nats-url` / `FM_CARVERAUTO_NATS_URL` - NATS server URL for the `nats` CLI; absent leaves the server to that CLI's own context or `NATS_URL`, which the overlay never copies onto argv. What is set here must not embed credentials: a URL with userinfo (`nats://user:pass@host`) is refused, because this value rides `nats --server` on argv
+- `config/carverauto-inbox-stream` / `FM_CARVERAUTO_INBOX_STREAM` - JetStream stream `fm-send` dual-writes to
+- `config/carverauto-portal-url` / `FM_CARVERAUTO_PORTAL_URL` - fleet portal, default `https://firstmate.carverauto.dev`
+
+The Discord webhook stays in firstmate-notify's gitignored `.env` as `DISCORD_WEBHOOK_URL`.
+NATS credentials stay in the `nats` CLI environment (`NATS_USER`, `NATS_PASSWORD`, `NATS_CREDS`), never in the server URL.
+Never commit those values.
+
+`bin/fm-steer.sh` is the OpenSpec CLI (`put`/`next`/`ack`/`list`, required `--stream`, subject `firstmate.steer.<task>`, payload `fm-task-inbox.v1`).
+JetStream is its only store: it needs natscli 0.4.0 or newer, whose `--templates=false` keeps a steer body byte for byte (older ones expand `{{...}}` in it and are refused), and a steer stays pending until `ack --stream-seq` acknowledges the exact steer `next` reported.
+`put` reads the named stream's own subject set first and refuses when `--stream` does not capture `firstmate.steer.<task>`, so the stream must exist before a steer is published and its name must match (NATS stream names are case-sensitive); the publish itself is a JetStream publish, which fails rather than reporting a delivery nothing stored.
+`next`, `ack`, and `list` address a durable pull consumer named after the stream, with `AckPolicy=explicit`; create it with `nats consumer add` before using them, because the overlay never provisions it.
+A portal assignment is a separate family on `firstmate.assign.<task>` with its own publisher.
+`bin/fm-steer.sh` never deletes a task's on-disk inbox under `state/<id>.inbox/`.
+Dual-write is additive only: it runs after the doorbell rings, is bounded by `FM_CARVERAUTO_DUAL_WRITE_BUDGET_SECS` (default 10 seconds) so an unreachable broker cannot delay a steer, and a dual-write that cannot reach NATS is a notice, never a failed steer.
+A re-run that deduplicates onto an existing on-disk record publishes again, so the JetStream mirror is at-least-once.
+
 ## Relay (.env)
 
 Relay lets a firstmate instance answer public mentions and act on normal reversible mention requests through firstmate's normal lifecycle.
