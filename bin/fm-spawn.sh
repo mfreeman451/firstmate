@@ -1937,6 +1937,30 @@ agy_model_validate() {  # <agy-bin> <model>
   return 1
 }
 
+# agy pre-launch effort validation (agy 1.2.14). `claude-*` ids reject ANY
+# explicit --effort: print mode errors, and interactive mode silently
+# substitutes another model, so the spawn omits the flag there and keeps the
+# model's fixed inherent reasoning. `-low`/`-medium`/`-high` suffixed ids
+# accept only the matching effort, so a mismatch refuses the spawn instead of
+# launching into the CLI's fallback model. `xhigh` and `max` stay in task
+# metadata under the record-and-omit contract.
+agy_effort_validate() {  # <model> <effort>
+  local model=$1 effort=$2 suffix
+  case "$effort" in '' | default | xhigh | max) return 0 ;; esac
+  case "$effort" in low | medium | high) ;; *) return 0 ;; esac
+  case "$model" in '' | default) return 0 ;; esac
+  case "$model" in claude-*) return 0 ;; esac
+  case "$model" in
+  *-low) suffix=low ;;
+  *-medium) suffix=medium ;;
+  *-high) suffix=high ;;
+  *) return 0 ;;
+  esac
+  [ "$effort" = "$suffix" ] && return 0
+  echo "error: agy model '$model' conflicts with --effort '$effort' (agy 1.2.14 accepts only the matching effort for a suffixed id); choose the matching effort or omit --effort" >&2
+  return 1
+}
+
 # The verified launch command per adapter. The knowledge half of each adapter
 # (busy-state source, exit command, dialogs, quirks) lives in the harness-adapters skill.
 launch_template() {
@@ -2368,6 +2392,7 @@ if [ "$HARNESS" = omp ]; then
 fi
 if [ "$HARNESS" = agy ]; then
   agy_model_validate "$AGY_BIN" "$MODEL" || exit 1
+  agy_effort_validate "$MODEL" "$EFFORT" || exit 1
 fi
 # Worker account pin (header above): resolved before any endpoint, worktree, or
 # record exists. An absent pin selects nothing and leaves every later launch
@@ -2588,8 +2613,14 @@ effort_flag_for_harness() {
     esac
     ;;
   agy)
-    # agy 1.2.0 --effort accepts exactly low|medium|high, so xhigh and max are
+    # agy 1.2.14 --effort accepts exactly low|medium|high, so xhigh and max are
     # omitted rather than passed as known-bad values (record-and-omit).
+    # claude-* ids reject any explicit --effort, so the flag is omitted for
+    # them and their fixed inherent reasoning is preserved; suffixed ids accept
+    # only the matching effort, and agy_effort_validate refuses a mismatch
+    # instead of launching into the CLI's fallback model.
+    agy_effort_validate "$model" "$effort" || return 1
+    case "$model" in claude-*) return 0 ;; esac
     case "$effort" in
     low | medium | high) printf -- '--effort %s ' "$(shell_quote "$effort")" ;;
     esac

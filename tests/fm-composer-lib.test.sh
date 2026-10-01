@@ -1023,6 +1023,47 @@ test_queued_enter_verdict_does_not_convert_other_states() {
   pass "fm_composer_queued_enter_verdict: only proven pending is converted"
 }
 
+test_matrix_agy_idle_composer_needs_rules_and_footer() {
+  # agy 1.2.14 draws its idle composer as a bare `>` row between two
+  # full-width solid `─` rules with the `? for shortcuts` status row below
+  # carrying the model cell. That conjunction is the positive proof the bare
+  # `>` is agy's composer; every smaller shape stays `unknown` under the
+  # dead-shell rule and typed text never reads empty.
+  local rule idle typed bare no_footer busy_footer claude_footer styled_idle
+  rule=$(printf '%80s' '' | tr ' ' '─')
+  idle=$'reply text\n'"$rule"$'\n>\n'"$rule"$'\n? for shortcuts                                                         Gemini 3.8 Flash · low'
+  typed=$'reply text\n'"$rule"$'\n> hello world typed probe\n'"$rule"$'\n? for shortcuts                                                         Gemini 3.8 Flash · low'
+  bare=$'some shell output\n>'
+  no_footer=$'reply text\n'"$rule"$'\n>\n'"$rule"
+  busy_footer=$'reply text\n'"$rule"$'\n>\n'"$rule"$'\nesc to cancel                                                           Gemini 3.8 Flash · low'
+  claude_footer=$'reply text\n'"$rule"$'\n>\n'"$rule"$'\n? for shortcuts                                                         Claude Opus 4.6 (Thinking)'
+  # Non-vacuousness: the footer predicate fires only on the verified idle row.
+  _fm_composer_row_is_agy_footer '? for shortcuts                                                         Gemini 3.8 Flash · low' \
+    || fail "the verified agy idle footer must be recognized as furniture"
+  _fm_composer_row_is_agy_footer 'esc to cancel                                                           Gemini 3.8 Flash · low' \
+    && fail "the busy footer must not count as the idle proof"
+  _fm_composer_row_is_agy_footer '? for shortcuts                                                         Claude Opus 4.6 (Thinking)' \
+    && fail "an unverified footer shape must not count as the idle proof"
+  _fm_composer_row_is_agy_footer 'please rerun the suite and report' \
+    && fail "ordinary prose must not be mistaken for agy furniture"
+  assert_screen "idle agy composer is empty" empty "$CAPS_STYLED" "$idle"
+  assert_screen "idle agy composer is empty without identity caps" empty "$CAPS_STYLED_NOID" "$idle"
+  assert_screen "idle agy composer is empty on a plain capture" empty "$CAPS_PLAIN" "$idle"
+  assert_screen "idle agy composer is empty with the cursor on its row" empty "$CAPS_TMUX" "$idle" 2
+  assert_screen "typed agy composer text is never empty" unknown "$CAPS_STYLED_NOID" "$typed"
+  assert_screen "typed agy composer text is never empty on a plain capture" unknown "$CAPS_PLAIN" "$typed"
+  assert_screen "bare shell > without furniture stays unknown" unknown "$CAPS_STYLED_NOID" "$bare"
+  assert_screen "agy rules without the footer stay unknown" unknown "$CAPS_STYLED_NOID" "$no_footer"
+  assert_screen "agy rules with the busy footer stay unknown" unknown "$CAPS_STYLED_NOID" "$busy_footer"
+  assert_screen "agy rules with an unverified footer stay unknown" unknown "$CAPS_STYLED_NOID" "$claude_footer"
+  # The verified styled bytes: a bright-truecolor `>` survives ghost
+  # stripping and a dim model cell survives ANSI stripping.
+  styled_idle=$'reply text\n'"$rule"$'\n'"${ESC}[38;2;122;162;247m>${ESC}[0m"$'\n'"$rule"$'\n? for shortcuts                                                         '"${ESC}[2mGemini 3.8 Flash · low${ESC}[0m"
+  assert_screen "styled agy idle bytes stay empty" empty "$CAPS_STYLED_NOID" "$styled_idle"
+  pass "matrix: agy's idle composer is empty only on rules plus the verified footer"
+}
+
 test_queued_enter_verdict_busy_pending_is_empty
 test_queued_enter_verdict_idle_pending_stays_pending
 test_queued_enter_verdict_does_not_convert_other_states
+test_matrix_agy_idle_composer_needs_rules_and_footer

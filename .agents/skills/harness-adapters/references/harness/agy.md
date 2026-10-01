@@ -20,8 +20,8 @@ Verified as a CREWMATE and SCOUT adapter only; `../../../../../bin/fm-spawn.sh` 
 | Marker | None; a live TUI carries no `AGY_*` or `ANTIGRAVITY_*` variable. |
 | Resume | `--continue` and `--conversation` exist but carry no verified pane-resume contract; use deterministic relaunch. |
 | Model | `--model <id>` with the bare catalog id from `agy models` (for example `gemini-3.8-flash-high`); `bin/fm-spawn.sh` refuses a requested id a reachable listing omits. The listing is a remote fetch, so the probe runs stdin-detached under the shared hard bound and an unreachable or hung listing launches unvalidated with a notice. |
-| Effort | `--effort low\|medium\|high`; `xhigh` and `max` stay in task metadata under the record-and-omit contract. |
-| Composer | Borderless bare `>` row, which the shared classifier reads as `unknown` under the dead-shell rule, never `empty`; steering confirms delivery through native agent-state and the delivery footer instead, the cursor precedent. |
+| Effort | `--effort low\|medium\|high`, omitted for `claude-*` ids (agy 1.2.14 rejects any explicit `--effort` there) and refused on a suffixed-id mismatch instead of launching into the CLI fallback; `xhigh` and `max` stay in task metadata under the record-and-omit contract. |
+| Composer | Borderless bare `>` row between two solid `─` rules with the `? for shortcuts` idle footer, which the shared classifier reads as `empty`; any smaller shape stays `unknown` under the dead-shell rule and typed text never reads `empty`. Steering confirms delivery through native agent-state and the delivery footer instead, the cursor precedent. |
 
 ## Trust, and where the decision persists
 
