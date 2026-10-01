@@ -43,6 +43,7 @@
 #   steering inbox. This never rewrites a project's instruction files or a
 #   secondmate's charter.
 #        fm-spawn.sh <task-id> --relaunch [--harness <name>] [--model <name>] [--effort <level>]
+#        fm-spawn.sh <task-id> <project-dir> --recover-late-slot --endpoint <target> --backend <tmux|herdr>
 #   --relaunch launches a replacement agent for an EXISTING task into that
 #   task's own recorded worktree, reusing its recorded endpoint when that
 #   endpoint still exists, instead of creating either from scratch. It is
@@ -70,6 +71,23 @@
 #   rebind is a recovery, never a teardown. Only a crewmate or scout rebinds: a
 #   secondmate whose endpoint is gone is respawned by its own owner
 #   (`--secondmate`, driven by the session-start liveness sweep).
+#   --recover-late-slot returns one stranded Treehouse slot to the pool: the
+#   slot a failed spawn's `treehouse get` allocated only after that spawn had
+#   already refused it at the end of the isolation wait below, so no worktree,
+#   claim, or task record was ever published for it. It launches nothing and
+#   publishes nothing. The slot is located from the live endpoint alone (no
+#   path argument), and the return is refused unless every proof holds: no
+#   task record exists for the id; the backend proves the endpoint agent-free
+#   (`dead` proceeds, `missing` is already-recovered and exits 0, anything else
+#   refuses); on tmux the window is the task's own fm-<id>; the pane's cwd is
+#   an isolated worktree of the project; it is a Treehouse pool slot of that
+#   project; its owner claim is absent or already this task's (read only, never
+#   written); and the copy is clean of uncommitted or unmerged changes, because
+#   `treehouse return --force` would discard them without asking. The return
+#   runs under the shared Treehouse project lock and the endpoint close after
+#   it is best-effort. --relaunch, --secondmate, batch pairs, and every
+#   launch-shaping flag are refused alongside it, and the failed dispatch's
+#   --backend and --endpoint are required rather than re-detected.
 #   Every fresh ship/scout launch and replacement explicitly enters the recorded
 #   worktree immediately before trust setup and brief delivery, and a pre-launch
 #   cwd check refuses any endpoint that still reports another copy; a Herdr shell
@@ -235,7 +253,10 @@
 #   out as a transient rather than adopted and then refused, so a home that is
 #   itself a linked worktree of the project repository still launches. A pane
 #   that never reaches an isolated worktree refuses at the end of that wait,
-#   naming the last path seen and why it was rejected.
+#   naming the last path seen and why it was rejected. That refusal also closes
+#   the endpoint the spawn created, so a `treehouse get` still in flight cannot
+#   complete late into a slot no record describes; a close that fails only
+#   warns, and a slot that strands anyway is owned by --recover-late-slot.
 #   That placement is proven only at launch. Every ship or scout pane therefore
 #   also receives `export FM_TASK_ID=<task-id>` before the launch command, on
 #   the same channel as GOTMPDIR, and bin/fm-test-run.sh refuses to execute the
@@ -655,6 +676,9 @@ YOLO_SET=0
 BRANCH_PREFIX_SET=0
 TRACEPARENT_SET=0
 RELAUNCH=0
+RECOVER_LATE_SLOT=0
+RECOVER_ENDPOINT=
+RECOVER_ENDPOINT_SET=0
 POS=()
 want_value=
 for a in "$@"; do
@@ -681,6 +705,10 @@ for a in "$@"; do
     backend)
       BACKEND_ARG=$a
       BACKEND_SET=1
+      ;;
+    endpoint)
+      RECOVER_ENDPOINT=$a
+      RECOVER_ENDPOINT_SET=1
       ;;
     mode)
       MODE=$a
@@ -716,6 +744,12 @@ for a in "$@"; do
     KIND_SET=1
     ;;
   --relaunch) RELAUNCH=1 ;;
+  --recover-late-slot) RECOVER_LATE_SLOT=1 ;;
+  --endpoint) want_value=endpoint ;;
+  --endpoint=*)
+    RECOVER_ENDPOINT=${a#--endpoint=}
+    RECOVER_ENDPOINT_SET=1
+    ;;
   --harness) want_value=harness ;;
   --harness=*)
     HARNESS_ARG=${a#--harness=}
@@ -779,6 +813,10 @@ done
   echo "error: --backend requires a non-empty value" >&2
   exit 1
 }
+[ "$RECOVER_ENDPOINT_SET" -eq 0 ] || [ -n "$RECOVER_ENDPOINT" ] || {
+  echo "error: --endpoint requires a non-empty value" >&2
+  exit 1
+}
 [ "$MODE_SET" -eq 0 ] || [ -n "$MODE" ] || {
   echo "error: --mode requires a non-empty value" >&2
   exit 1
@@ -837,7 +875,7 @@ if [ "$RELAUNCH" -eq 1 ]; then
     echo "error: --relaunch reuses the task's recorded ship branch; --branch-prefix cannot override it" >&2
     exit 1
   }
-else
+elif [ "$RECOVER_LATE_SLOT" -eq 0 ]; then
   # Delivery contract (AGENTS.md section 7). A ship task's mode and yolo are
   # firstmate's per-task decision, so they are required and closed-set validated
   # here rather than resolved from the project registry. Scouts deliver a report
@@ -884,6 +922,330 @@ else
     }
   fi
 fi
+
+# --recover-late-slot reconciles one stranded Treehouse slot whose allocation
+# finished after its spawn already refused it. It launches nothing, so every
+# launch-shaping flag contradicts it, and the failed dispatch's backend and
+# endpoint are required rather than re-detected: guessing either could adopt
+# or return another home's slot.
+if [ "$RECOVER_LATE_SLOT" -eq 1 ]; then
+  [ "$RELAUNCH" -eq 0 ] || {
+    echo "error: --recover-late-slot contradicts --relaunch, which needs the task record this recovery's failure never published" >&2
+    exit 1
+  }
+  [ "$KIND" != secondmate ] || {
+    echo "error: --recover-late-slot contradicts --secondmate, which never allocates a Treehouse slot" >&2
+    exit 1
+  }
+  [ "$BACKEND_SET" -eq 1 ] || {
+    echo "error: --recover-late-slot requires --backend <name> from the failed dispatch; the backend is never re-detected" >&2
+    exit 1
+  }
+  [ "$RECOVER_ENDPOINT_SET" -eq 1 ] || {
+    echo "error: --recover-late-slot requires --endpoint <target> from the failed spawn's log; the slot is located from that exact endpoint, never from a path argument" >&2
+    exit 1
+  }
+  [ "$HARNESS_SET" -eq 0 ] || {
+    echo "error: --recover-late-slot launches nothing; --harness cannot override it" >&2
+    exit 1
+  }
+  [ "$MODEL_SET" -eq 0 ] || {
+    echo "error: --recover-late-slot launches nothing; --model cannot override it" >&2
+    exit 1
+  }
+  [ "$EFFORT_SET" -eq 0 ] || {
+    echo "error: --recover-late-slot launches nothing; --effort cannot override it" >&2
+    exit 1
+  }
+  [ "$MODE_SET" -eq 0 ] || {
+    echo "error: --recover-late-slot launches nothing; --mode cannot override it" >&2
+    exit 1
+  }
+  [ "$YOLO_SET" -eq 0 ] || {
+    echo "error: --recover-late-slot launches nothing; --yolo cannot override it" >&2
+    exit 1
+  }
+  [ "$BRANCH_PREFIX_SET" -eq 0 ] || {
+    echo "error: --recover-late-slot launches nothing; --branch-prefix cannot override it" >&2
+    exit 1
+  }
+  case "${POS[0]:-}" in
+  *=*)
+    echo "error: --recover-late-slot recovers one task only; batch dispatch cannot carry it" >&2
+    exit 1
+    ;;
+  esac
+fi
+
+resolve_project_dir_arg() {
+  local path=$1
+  case "$path" in
+  projects/*) printf '%s/%s\n' "$PROJECTS" "${path#projects/}" ;;
+  *) printf '%s\n' "$path" ;;
+  esac
+}
+
+# True when <path> is an isolated worktree of the spawning project: a real
+# directory that is its own worktree root, is not the spawning project itself,
+# and does not share the project repository's common git dir. SPAWN_WT_TOP is
+# left holding the worktree root the check read, and SPAWN_WT_REASON a short
+# phrase naming why a rejected path failed, both for the refusal messages.
+#
+# The worktree-discovery poll below reads this same predicate, so it can never
+# adopt a path the guard would then refuse. That matters because a pane's cwd
+# read is a snapshot of whatever process is in the foreground: while `treehouse
+# get` is still fetching and checking a slot out, it reports the REPOSITORY's
+# primary checkout as its own cwd. That path differs from a linked spawning
+# project, so a poll comparing only against the project accepted it, and the
+# guard then refused a launch whose slot treehouse went on to create normally.
+# A read like that is a transient, not a destination: the poll keeps waiting.
+SPAWN_WT_TOP=
+SPAWN_WT_REASON=
+spawn_worktree_isolated() { # <path>
+  local path=$1 wt_real wt_top_real wt_git_dir proj_common
+  SPAWN_WT_TOP=
+  SPAWN_WT_REASON=
+  wt_real=
+  if ! wt_real=$(cd "$path" 2>/dev/null && pwd -P); then
+    wt_real=
+  fi
+  if [ -z "$wt_real" ]; then
+    SPAWN_WT_REASON="it is not a readable directory"
+    return 1
+  fi
+  SPAWN_WT_TOP=$(git -C "$path" rev-parse --show-toplevel 2>/dev/null || true)
+  # A path in no repository leaves the toplevel empty, and that empty value must
+  # never reach `cd`: bash before 5.3 accepts `cd ""` as a successful no-op, so
+  # it would resolve to fm-spawn's OWN cwd and report the path as a subdirectory
+  # of whatever checkout firstmate happens to be running from.
+  wt_top_real=
+  if [ -n "$SPAWN_WT_TOP" ] && ! wt_top_real=$(cd "$SPAWN_WT_TOP" 2>/dev/null && pwd -P); then
+    wt_top_real=
+  fi
+  if [ -z "$wt_top_real" ]; then
+    SPAWN_WT_REASON="it is not inside a git worktree"
+    return 1
+  fi
+  if [ "$wt_real" != "$wt_top_real" ]; then
+    SPAWN_WT_REASON="it is a subdirectory of worktree root '$wt_top_real', not a worktree root"
+    return 1
+  fi
+  if [ "$wt_real" = "$PROJ_ABS_REAL" ]; then
+    SPAWN_WT_REASON="it is the spawning project itself"
+    return 1
+  fi
+  # The primary checkout uses the repository's common git dir as its own git
+  # dir. A linked spawning home has a different top-level, but the same common
+  # dir, so comparing only the two working directories cannot protect primary.
+  wt_git_dir=$(git -C "$path" rev-parse --absolute-git-dir 2>/dev/null) &&
+    wt_git_dir=$(cd "$wt_git_dir" 2>/dev/null && pwd -P) || wt_git_dir=
+  proj_common=$(git -C "$PROJ_ABS" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) &&
+    proj_common=$(cd "$proj_common" 2>/dev/null && pwd -P) || proj_common=
+  if [ -z "$wt_git_dir" ] || [ -z "$proj_common" ]; then
+    SPAWN_WT_REASON="its git directory could not be resolved"
+    return 1
+  fi
+  if [ "$wt_git_dir" = "$proj_common" ]; then
+    SPAWN_WT_REASON="it is the repository's primary checkout (its git dir is the spawning project's common git dir)"
+    return 1
+  fi
+  return 0
+}
+
+spawn_current_path() { # <target>
+  case "$BACKEND" in
+  tmux) fm_backend_tmux_current_path "$1" ;;
+  herdr) fm_backend_herdr_current_path "$1" ;;
+  zellij) fm_backend_zellij_current_path "$1" "$W" ;;
+  cmux) fm_backend_cmux_current_path "$1" "$W" ;;
+  esac
+}
+
+# --recover-late-slot: return one stranded Treehouse slot to the pool.
+# A spawn whose `treehouse get` outlasted the 60s isolation wait exits without
+# a worktree, a claim, or a task record, while the pane's allocation can still
+# complete late into a slot no record describes. A blind fresh spawn then takes
+# another slot and the strand accumulates until the pool refuses. This mode
+# proves that exact strand and returns it, so a normal spawn can proceed.
+# The slot is located from the live endpoint alone: the command takes no path,
+# and every proof below re-reads rather than trusts the command line.
+# Proofs, in order: no task record exists (a recorded task belongs to
+# relaunch/teardown); the backend has a recovery-grade agent-state classifier,
+# so agent absence is proven rather than inferred; the endpoint reads `dead`
+# (shell-only, no agent) - `missing` is already-recovered and exits 0 without
+# touching anything, while any other verdict refuses; on tmux the window name
+# is this task's own fm-<id> (the spawn pins renames off, so any other name is
+# a renamed, foreign, or mistyped endpoint); the pane's live cwd is an isolated
+# worktree of this project (the isolation guard's own predicate); it is a
+# Treehouse pool slot of this project; its owner claim is absent or already
+# this task's (a claim naming another task refuses - the claim is read only
+# and never written here, so recovery leaves no record either way); and the
+# slot is clean of uncommitted or unmerged changes (anything else refuses and
+# preserves the work, exactly as teardown's landed-work gates would).
+# The return itself runs under the shared Treehouse project lock, like spawn
+# allocation and teardown, and refuses rather than races a concurrent holder.
+# `treehouse return --force` would discard uncommitted changes without asking,
+# which is why the cleanliness proof above is load-bearing and comes first.
+# The endpoint close afterwards is best-effort: the slot is already back in
+# the pool, so a lingering empty window holds no lease and only warns.
+# Residual risk, stated plainly: two homes can mint the same task id for one
+# project, and a same-named window in another session is out of this read, so
+# run this only with the endpoint from this home's own failed spawn log. The
+# shell-only, clean-tree, and claim proofs are what stand between a wrong
+# handle and another lane's live work.
+spawn_recover_late_slot() {
+  local proj_arg backend target session window pane_wt slot claim_pre lock return_out
+  local dirty_raw dirty unmerged_raw unmerged agent_state close_state
+  proj_arg=${POS[1]:-}
+  [ -n "$proj_arg" ] || {
+    echo "error: --recover-late-slot takes <task-id> <project-dir> plus --endpoint and --backend" >&2
+    return 1
+  }
+  [ "${#POS[@]}" -eq 2 ] || {
+    echo "error: --recover-late-slot takes exactly <task-id> <project-dir>" >&2
+    return 1
+  }
+  if [ -e "$STATE/$ID.meta" ] || [ -L "$STATE/$ID.meta" ]; then
+    echo "error: task $ID already has a record at $STATE/$ID.meta; a stranded slot cannot belong to it (relaunch or teardown owns that record)" >&2
+    return 1
+  fi
+  backend=$BACKEND_ARG
+  case "$backend" in
+  tmux | herdr) ;;
+  *)
+    echo "error: --recover-late-slot refuses backend '$backend': only backends with a recovery-grade agent-state classifier (tmux, herdr) can prove the stranded endpoint agent-free" >&2
+    return 1
+    ;;
+  esac
+  fm_control_backend_state_verified "$backend" || {
+    echo "error: backend '$backend' has no recovery-grade agent-state classifier, so recovery cannot prove the stranded endpoint agent-free; refusing rather than risking another lane's live worker" >&2
+    return 1
+  }
+  fm_backend_validate_spawn "$backend" || return 1
+  fm_backend_source "$backend" || return 1
+  BACKEND=$backend
+  target=$RECOVER_ENDPOINT
+  # A colon-bearing window or pane name would split ambiguously, so any target
+  # that is not exactly one session plus one non-empty window/pane refuses.
+  case "$target" in
+  *:*:* | '' | :* | *:)
+    echo "error: refusing ambiguous endpoint '$target'; pass the exact session:window (tmux) or session:pane (herdr) from the failed spawn's log" >&2
+    return 1
+    ;;
+  *:*)
+    session=${target%%:*}
+    window=${target#*:}
+    [ -n "$session" ] && [ -n "$window" ] && [ "$session:$window" = "$target" ] || {
+      echo "error: refusing ambiguous endpoint '$target'; pass the exact session:window (tmux) or session:pane (herdr) from the failed spawn's log" >&2
+      return 1
+    }
+    ;;
+  *)
+    echo "error: refusing ambiguous endpoint '$target'; pass the exact session:window (tmux) or session:pane (herdr) from the failed spawn's log" >&2
+    return 1
+    ;;
+  esac
+  # The task binding comes before any liveness read: a handle that cannot name
+  # this task is refused even when it points at nothing at all, so a mistyped
+  # endpoint fails loudly instead of converging to a no-op.
+  if [ "$backend" = tmux ] && [ "$window" != "fm-$ID" ]; then
+    echo "error: refusing endpoint '$target': its window is not this task's fm-$ID, so it cannot be bound to $ID (renamed, foreign, or mistyped handle)" >&2
+    return 1
+  fi
+  agent_state=$(fm_backend_agent_state "$backend" "$target")
+  case "$agent_state" in
+  missing)
+    echo "recovered $ID: endpoint $target is already gone and no task record exists; nothing to return"
+    return 0
+    ;;
+  dead) ;;
+  *)
+    echo "error: endpoint $target reads '$agent_state'; recovery requires a positively agent-free (dead) or gone (missing) endpoint - stop any agent there first, then re-run" >&2
+    return 1
+    ;;
+  esac
+  pane_wt=$(spawn_current_path "$target" || true)
+  [ -n "$pane_wt" ] || {
+    echo "error: endpoint $target reported no working directory; refusing to guess its slot" >&2
+    return 1
+  }
+  PROJ_ABS="$(cd "$(resolve_project_dir_arg "$proj_arg")" && pwd)" || {
+    echo "error: project directory cannot be resolved: $proj_arg" >&2
+    return 1
+  }
+  PROJ_ABS_REAL=$(cd "$PROJ_ABS" 2>/dev/null && pwd -P) || PROJ_ABS_REAL="$PROJ_ABS"
+  if ! spawn_worktree_isolated "$pane_wt"; then
+    echo "error: endpoint $target sits in '${pane_wt}' (${SPAWN_WT_REASON:-unreadable}); refusing to return anything but an isolated worktree of '$PROJ_ABS'" >&2
+    return 1
+  fi
+  slot=$pane_wt
+  if ! fm_treehouse_pool_slot "$PROJ_ABS" "$slot"; then
+    echo "error: '${slot}' is not a Treehouse pool slot of '$PROJ_ABS'; refusing to return a copy treehouse does not own" >&2
+    return 1
+  fi
+  lock=$(fm_treehouse_project_lock_path "$PROJ_ABS") || {
+    echo "error: could not resolve the shared Treehouse project lock for $PROJ_ABS" >&2
+    return 1
+  }
+  if ! fm_lock_try_acquire "$lock"; then
+    echo "error: another Treehouse slot allocation or return is in progress for $PROJ_ABS; refusing to race it" >&2
+    return 1
+  fi
+  SPAWN_TREEHOUSE_PROJECT_LOCK=$lock
+  SPAWN_TREEHOUSE_PROJECT_LOCK_HELD=1
+  fm_treehouse_slot_owner_state "$slot" "$ID"
+  claim_pre=$FM_TREEHOUSE_SLOT_OWNER
+  case "$claim_pre" in
+  absent | mine) ;;
+  *)
+    fm_lock_release "$lock" || true
+    SPAWN_TREEHOUSE_PROJECT_LOCK_HELD=0
+    echo "error: slot '${slot}' is claimed by task ${FM_TREEHOUSE_SLOT_OWNER_ID:-<unreadable>}${FM_TREEHOUSE_SLOT_OWNER_HOME:+ (home $FM_TREEHOUSE_SLOT_OWNER_HOME)}, not $ID; leaving it untouched" >&2
+    return 1
+    ;;
+  esac
+  if ! dirty_raw=$(git -C "$slot" status --porcelain 2>/dev/null); then
+    fm_lock_release "$lock" || true
+    SPAWN_TREEHOUSE_PROJECT_LOCK_HELD=0
+    echo "error: cannot inspect '${slot}' for uncommitted changes; preserving it unread rather than returning blind" >&2
+    return 1
+  fi
+  dirty=$(printf '%s\n' "$dirty_raw" | grep -vE '^\?\? (\.claude/|\.fm-(grok|kimi)-turnend$)' | head -1 || true)
+  unmerged_raw=$(git -C "$slot" ls-files -u 2>/dev/null || true)
+  unmerged=$(printf '%s\n' "$unmerged_raw" | head -1 || true)
+  if [ -n "$dirty" ] || [ -n "$unmerged" ]; then
+    fm_lock_release "$lock" || true
+    SPAWN_TREEHOUSE_PROJECT_LOCK_HELD=0
+    [ -n "$dirty" ] && echo "uncommitted changes present" >&2
+    [ -n "$unmerged" ] && echo "unmerged paths present" >&2
+    echo "error: '${slot}' holds unlanded work; refusing to return it (adopt the copy instead of recovering the slot)" >&2
+    return 1
+  fi
+  if return_out=$(cd "$PROJ_ABS" && treehouse return --force "$slot" 2>&1); then
+    [ -n "$return_out" ] && printf '%s\n' "$return_out"
+  else
+    fm_lock_release "$lock" || true
+    SPAWN_TREEHOUSE_PROJECT_LOCK_HELD=0
+    [ -n "$return_out" ] && printf '%s\n' "$return_out" >&2
+    echo "error: treehouse return failed for '${slot}'; leaving the claim and endpoint in place for a re-run" >&2
+    return 1
+  fi
+  fm_lock_release "$lock" || true
+  SPAWN_TREEHOUSE_PROJECT_LOCK_HELD=0
+  if ! fm_backend_kill "$BACKEND" "$target" 2>/dev/null; then
+    echo "warning: slot '${slot}' is back in the pool but endpoint $target could not be closed; it holds no lease - close it by hand" >&2
+  else
+    close_state=$(fm_backend_agent_state "$BACKEND" "$target")
+    case "$close_state" in
+    missing | dead) ;;
+    *)
+      echo "warning: slot '${slot}' is back in the pool but endpoint $target still reads '$close_state' after its close; it holds no lease - close it by hand" >&2
+      ;;
+    esac
+  fi
+  echo "recovered $ID slot=$slot endpoint=$target backend=$backend claim=$claim_pre"
+  return 0
+}
 
 spawn_remote_secondmate() {
   local id=$1 remote host root home harness positional model effort backend out rc meta tmp
@@ -1495,6 +1857,12 @@ fm_task_id_creation_valid "$ID" || {
   echo "error: invalid task id" >&2
   exit 2
 }
+# Late-slot recovery never reaches endpoint creation or launch: it proves the
+# stranded slot its failed spawn left behind and returns it to the pool.
+if [ "$RECOVER_LATE_SLOT" -eq 1 ]; then
+  spawn_recover_late_slot
+  exit "$?"
+fi
 if [ "$RELAUNCH" -eq 0 ] && [ "$KIND" = ship ]; then
   BRANCH="$BRANCH_PREFIX$ID"
   if ! git check-ref-format --branch "$BRANCH" >/dev/null 2>&1; then
@@ -2800,14 +3168,6 @@ resolved_existing_dir() {
   cd "$path" && pwd -P
 }
 
-resolve_project_dir_arg() {
-  local path=$1
-  case "$path" in
-  projects/*) printf '%s/%s\n' "$PROJECTS" "${path#projects/}" ;;
-  *) printf '%s\n' "$path" ;;
-  esac
-}
-
 path_is_ancestor_of() {
   local ancestor=$1 path=$2
   [ -n "$ancestor" ] || return 1
@@ -3181,73 +3541,6 @@ real_path_or_raw() { # <path>
 # herdr-sm-spaces-k4). Both branches converge on the same $T ("target") string
 # that every downstream operation (send/capture/kill) already treats as opaque
 # per-backend routing (fm_backend_resolve_selector).
-
-# True when <path> is an isolated worktree of the spawning project: a real
-# directory that is its own worktree root, is not the spawning project itself,
-# and does not share the project repository's common git dir. SPAWN_WT_TOP is
-# left holding the worktree root the check read, and SPAWN_WT_REASON a short
-# phrase naming why a rejected path failed, both for the refusal messages.
-#
-# The worktree-discovery poll below reads this same predicate, so it can never
-# adopt a path the guard would then refuse. That matters because a pane's cwd
-# read is a snapshot of whatever process is in the foreground: while `treehouse
-# get` is still fetching and checking a slot out, it reports the REPOSITORY's
-# primary checkout as its own cwd. That path differs from a linked spawning
-# project, so a poll comparing only against the project accepted it, and the
-# guard then refused a launch whose slot treehouse went on to create normally.
-# A read like that is a transient, not a destination: the poll keeps waiting.
-SPAWN_WT_TOP=
-SPAWN_WT_REASON=
-spawn_worktree_isolated() { # <path>
-  local path=$1 wt_real wt_top_real wt_git_dir proj_common
-  SPAWN_WT_TOP=
-  SPAWN_WT_REASON=
-  wt_real=
-  if ! wt_real=$(cd "$path" 2>/dev/null && pwd -P); then
-    wt_real=
-  fi
-  if [ -z "$wt_real" ]; then
-    SPAWN_WT_REASON="it is not a readable directory"
-    return 1
-  fi
-  SPAWN_WT_TOP=$(git -C "$path" rev-parse --show-toplevel 2>/dev/null || true)
-  # A path in no repository leaves the toplevel empty, and that empty value must
-  # never reach `cd`: bash before 5.3 accepts `cd ""` as a successful no-op, so
-  # it would resolve to fm-spawn's OWN cwd and report the path as a subdirectory
-  # of whatever checkout firstmate happens to be running from.
-  wt_top_real=
-  if [ -n "$SPAWN_WT_TOP" ] && ! wt_top_real=$(cd "$SPAWN_WT_TOP" 2>/dev/null && pwd -P); then
-    wt_top_real=
-  fi
-  if [ -z "$wt_top_real" ]; then
-    SPAWN_WT_REASON="it is not inside a git worktree"
-    return 1
-  fi
-  if [ "$wt_real" != "$wt_top_real" ]; then
-    SPAWN_WT_REASON="it is a subdirectory of worktree root '$wt_top_real', not a worktree root"
-    return 1
-  fi
-  if [ "$wt_real" = "$PROJ_ABS_REAL" ]; then
-    SPAWN_WT_REASON="it is the spawning project itself"
-    return 1
-  fi
-  # The primary checkout uses the repository's common git dir as its own git
-  # dir. A linked spawning home has a different top-level, but the same common
-  # dir, so comparing only the two working directories cannot protect primary.
-  wt_git_dir=$(git -C "$path" rev-parse --absolute-git-dir 2>/dev/null) &&
-    wt_git_dir=$(cd "$wt_git_dir" 2>/dev/null && pwd -P) || wt_git_dir=
-  proj_common=$(git -C "$PROJ_ABS" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) &&
-    proj_common=$(cd "$proj_common" 2>/dev/null && pwd -P) || proj_common=
-  if [ -z "$wt_git_dir" ] || [ -z "$proj_common" ]; then
-    SPAWN_WT_REASON="its git directory could not be resolved"
-    return 1
-  fi
-  if [ "$wt_git_dir" = "$proj_common" ]; then
-    SPAWN_WT_REASON="it is the repository's primary checkout (its git dir is the spawning project's common git dir)"
-    return 1
-  fi
-  return 0
-}
 
 validate_spawn_worktree() { # <source> <inspect-target>
   local source=$1 inspect_target=$2
@@ -3831,14 +4124,6 @@ spawn_send_text_line() { # <target> <text>
   cmux) fm_backend_cmux_send_text_line "$1" "$2" "$W" ;;
   esac
 }
-spawn_current_path() { # <target>
-  case "$BACKEND" in
-  tmux) fm_backend_tmux_current_path "$1" ;;
-  herdr) fm_backend_herdr_current_path "$1" ;;
-  zellij) fm_backend_zellij_current_path "$1" "$W" ;;
-  cmux) fm_backend_cmux_current_path "$1" "$W" ;;
-  esac
-}
 spawn_send_literal() { # <target> <text>
   case "$BACKEND" in
   tmux) fm_backend_tmux_send_literal "$1" "$2" ;;
@@ -4275,7 +4560,19 @@ elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
     sleep 1
   done
   if [ -z "$WT" ]; then
-    echo "error: treehouse get did not enter an isolated worktree within 60s (last seen '${last_seen:-none}': $last_reason; spawning project '$PROJ_ABS'); inspect window $T" >&2
+    # The pane's `treehouse get` may still complete after this refusal into a
+    # slot no record describes, so close the endpoint this spawn created while
+    # the failure is still in hand. Nothing was ever launched or published
+    # from it, so there is nothing to preserve; a close that fails only warns,
+    # and a slot that strands anyway is owned by --recover-late-slot below.
+    deadline_tab_id=
+    [ "$BACKEND" = zellij ] && deadline_tab_id=$ZELLIJ_TAB_ID
+    if fm_backend_kill "$BACKEND" "$T" "$deadline_tab_id" "fm-$ID" 2>/dev/null; then
+      SPAWN_ENDPOINT_CLOSED=1
+    else
+      echo "warning: could not close $T after the isolation wait; a late treehouse allocation there may strand a slot - reconcile it with bin/fm-spawn.sh $ID <project> --recover-late-slot --endpoint $T --backend $BACKEND" >&2
+    fi
+    echo "error: treehouse get did not enter an isolated worktree within 60s (last seen '${last_seen:-none}': $last_reason; spawning project '$PROJ_ABS'); the endpoint was closed to stop a late allocation" >&2
     exit 1
   fi
 
