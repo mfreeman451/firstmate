@@ -7,7 +7,7 @@ The skill tree rooted at [`.agents/skills/harness-adapters/SKILL.md`](../../.age
 
 | Field | Value |
 |---|---|
-| Version | `agy 1.2.0`; the send-confirmation timing below was re-measured on `agy 1.2.1` (2026-09-12) |
+| Version | `agy 1.2.0`; the send-confirmation timing below was re-measured on `agy 1.2.1` (2026-09-12); the model-specific effort matrix and the idle-composer shape below were established on `agy 1.2.14` (2026-10-01) |
 | Verified | 2026-09-10 |
 | Binary | `/home/andpod/.local/bin/agy`, an ELF 64-bit Go-compiled single executable |
 | Platform | Linux x64 (Arch, kernel 7.2.3) |
@@ -86,6 +86,14 @@ The bare `gemini-3.8-flash` id from this home's previous config is not listed; o
 `bin/fm-spawn.sh`'s `agy_model_validate` refuses a requested id a reachable `agy models` listing omits, and launches unvalidated with a stderr notice when the listing is unreachable.
 The listing is a remote fetch (`Fetching available models...`), so the probe runs with stdin detached under the shared hard bound from `bin/fm-timeout-lib.sh` (15 seconds by default, `FM_AGY_MODELS_TIMEOUT`; a non-positive or non-numeric value clamps back to that default, because a non-positive bound is not a bound); a stalled fetch or a sign-in prompt is cut off and falls through to the unvalidated launch instead of blocking the spawn before any pane exists.
 Print mode (`agy -p "Reply with exactly: AGY_PRINT_PROBE_OK" --model gemini-3.8-flash-low`) returned the exact reply with exit 0 in about 8 seconds, proving the credential path without a pane.
+On `agy 1.2.14` the effort capability is model-specific.
+`agy --model claude-opus-4-6-thinking --effort high --print ...` exits 1 with `error: invalid model selection (--model "claude-opus-4-6-thinking" --effort "high"): --effort is not supported for model "claude-opus-4-6-thinking"`, and `--effort low` is rejected identically, while the same launch in interactive mode boots and warns `--effort is not supported for model "claude-opus-4-6-thinking". Using "Gemini 3.8 Flash (High)" instead`, silently substituting another model.
+`agy --model claude-sonnet-4-6 --effort high` is rejected in the same class.
+`agy --model claude-opus-4-6-thinking` with no `--effort` keeps `Claude Opus 4.6 (Thinking)` in its header and footer.
+Suffixed ids accept only the matching effort: `agy --model gemini-3.8-flash-low --effort low` passes validation, while `--effort high` exits 1 with a `--model gemini-3.8-flash-low conflicts with --effort=high` error, and `gpt-oss-120b-medium` behaves the same for `medium` versus `high`.
+`agy --effort max --print ...` exits 1 because no suffixed catalog id carries a `max` effort, so the existing record-and-omit for `max` (and `xhigh`) stays correct.
+`bin/fm-spawn.sh` therefore omits `--effort` for `claude-*` ids and refuses a suffixed-id mismatch before pane creation (`agy_effort_validate`, beside `agy_model_validate`), never launching into the fallback.
+`tests/fm-agy-harness.test.sh` pins the omission, the refusal, and the matching carry-through against the fake catalog.
 
 ## Busy state: the pinned status row, unknown on absence
 
@@ -135,10 +143,14 @@ Herdr tracks agy natively (`antigravity-cli` integration, detected as `agent=agy
 The tmux adapter classifies the anchored process name `agy` as `agent` through the shared name vocabulary in `bin/fm-agent-process-lib.sh`, the muse/omp precedent for short bare-word names.
 agy stays out of the session-lock name vocabulary in `bin/fm-session-lock-lib.sh`, where the other crewmate-only adapters are also absent.
 
-## Composer: unknown by design
+## Composer: empty only on the verified idle shape
 
-Byte-level capture of the idle pane shows a bare unstyled `>` between two full-width `─` rules, with an unstyled `? for shortcuts` cell and a dim (`SGR 2`) model cell in the status row below.
-The shared classifier reads that bare `>` as `unknown` under the dead-shell rule, never `empty`.
+Byte-level capture of the idle pane (agy 1.2.14) shows a bare `>` row between two full-width `─` rules, with an unstyled `? for shortcuts` cell and a dim (`SGR 2`) model cell in the status row below, for example `? for shortcuts ... Gemini 3.8 Flash · low`.
+The `>` glyph carries bright truecolor (`38;2;122;162;247`), above the ghost-strip threshold, so no ghost rule can erase it.
+That conjunction - bare `>` exactly filling the rule pair plus the verified idle footer - is the positive proof the row is agy's composer, and the shared classifier reads exactly that shape as `empty`.
+Every smaller shape stays `unknown` under the dead-shell rule: a bare `>` without the rules and footer, a footer carrying the busy `esc to cancel` row instead of the idle row, and any unverified footer shape such as a Claude-labeled model cell.
+Typed text fails the exact-`>` match, so it never reads `empty`.
+`tests/fm-composer-lib.test.sh` pins the conjunction and each refusal with canned 1.2.14-shaped screens, including the styled bytes.
 Steering still confirms delivery: the Herdr submit core leads with the native `idle`-to-`working` transition, which agy performs, and the delivery footer regex covers the tmux path.
 agy renders the busy footer late for that confirm loop - about 1.5 s after Enter for a short steer and 4-5 s for a realistic longer brief, measured live on `agy 1.2.1` (2026-09-12) against the shared budget's 3 x 0.4 s - so `bin/fm-send.sh` gives agy typed targets a longer default submit-confirm budget (20 retries, about 8 s at the default cadence); an explicit `FM_SEND_RETRIES` still wins and every other harness keeps the shared 3-retry default.
 `tests/fm-send-agy-confirm.test.sh` pins the raised default and `tests/fm-agy-harness.test.sh` pins the Herdr transition path.
@@ -165,6 +177,6 @@ No primary or secondmate behavior was built or tested, and none is claimed.
 Run the portable suite and the live guard after any agy upgrade, because the process name, marker set, trust dialog text, and rendered busy/interrupt text are all vendor-controlled surfaces that the spawn gate and the busy fallback match verbatim:
 
 ```
-bin/fm-test-run.sh tests/fm-agy-harness.test.sh
+bin/fm-test-run.sh tests/fm-agy-harness.test.sh tests/fm-composer-lib.test.sh
 FM_AGY_SIGNALS_LIVE=1 bin/fm-test-run.sh tests/fm-agy-signals-live-e2e.test.sh
 ```

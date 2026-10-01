@@ -135,6 +135,14 @@ printf '%s' "$screen" | grep -v '^[[:space:]]*$' | tail -12 | fm_busy_lines_matc
   && fail "harness=agy matched its own idle footer as busy" || true
 printf '%s' "$screen" | fm_busy_agy_tail_busy \
   && fail "the settled agy footer still matches the busy signature" || true
+# The settled idle composer carries the verified positive-evidence shape (bare
+# `>` between the solid rules with the idle footer), so the shared classifier
+# must read a fresh capture of it as empty rather than unknown.
+screen=$(capture)
+agy_idle_verdict=$(fm_composer_classify_screen "$(printf 'styled=0\ncursor=0\nidentity=0\nrows=20')" "$screen") || agy_idle_verdict=unknown
+[ "$agy_idle_verdict" = empty ] \
+  || fail "the settled agy idle composer classified '$agy_idle_verdict', want empty"
+pass "the settled agy idle composer classifies empty"
 
 # The dialog can outlive the turn it gated, so a still-rendered dialog must be
 # dismissed before steering anything: typed text would land in it instead of

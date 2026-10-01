@@ -120,7 +120,9 @@
 # what a pane shows once its agent has exited to a plain login shell - is a
 # genuine empty agent composer ONLY inside a bordered container. On a bare row
 # it is a dead-shell prompt and classifies `unknown` (never a safe injection
-# target). A `$` followed immediately by a digit is Pi's cost footer, not this
+# target), with one positive-evidence exception: agy's bare `>` between its
+# solid rules and idle footer (`FM_COMPOSER_AGY_FOOTER_RE_DEFAULT`). A `$`
+# followed immediately by a digit is Pi's cost footer, not this
 # prompt (`FM_COMPOSER_PI_STATUS_RE_DEFAULT`).
 # The AGENT glyphs `❯` (claude), `›` (codex), `⟩` (U+27E9, muse),
 # `→` (U+2192, cursor), and `❭` (U+276D, devin) are a genuine empty agent
@@ -375,8 +377,9 @@ fm_composer_strip_ghost() {
 # outside its composer and the composer verdict is therefore always `unknown`.
 # agy's `esc to cancel` is part of the union for the same reason: an explicit
 # tmux agy endpoint reaches the submit core with no recorded harness, and its
-# bare `>` composer verdict is `unknown`, so the busy footer is the only
-# turn-started acknowledgement that path can read.
+# bare `>` composer verdict is `unknown` unless the idle rule pair and footer
+# prove it empty (the positive-evidence exception above), so the busy footer is
+# the only turn-started acknowledgement that path can read.
 FM_DELIVERY_BUSY_REGEX_DEFAULT='esc (to )?interrupt|Working(\.\.\.|…)|Ctrl\+c:cancel|ctrl\+c to stop|esc[[:space:]]+to[[:space:]]+cancel|esc twice to interrupt|^[[:space:]]*❭ Guide Devin while it works$'
 FM_DELIVERY_CLAUDE_BUSY_REGEX_DEFAULT='esc to interrupt|…[[:space:]]+\([0-9]+[smh]'
 # Devin 3000.11.1: the working composer and interrupt hint are independent
@@ -553,6 +556,16 @@ fm_composer_strip_braille() {
 # and Herdr adapter composer reads use their visible viewports instead; Herdr
 # also uses this value as the minimum Ctrl+U clear budget after a refused proof.
 FM_COMPOSER_CAPTURE_LINES=${FM_COMPOSER_CAPTURE_LINES:-20}
+
+# agy (Antigravity CLI) draws its idle composer as a bare `>` row between two
+# solid `─` rules, with the `? for shortcuts` status row below carrying the
+# model cell (verified live on agy 1.2.14: `? for shortcuts` on the left and
+# `Gemini 3.8 Flash · low` on the right). That conjunction is the positive
+# proof the bare `>` is agy's composer and not a dead-shell prompt; a bare `>`
+# without it stays `unknown` under the dead-shell rule. Only the verified `·
+# low|medium|high` footer is recognized, so any other footer shape stays
+# `unknown` until it is verified live.
+FM_COMPOSER_AGY_FOOTER_RE_DEFAULT='^\? for shortcuts.*·[[:space:]]+(low|medium|high)[[:space:]]*$'
 
 # Pi allows a multi-line composer between its horizontal separators. Bound the
 # structural candidate so two unrelated transcript rules with an arbitrarily
@@ -1209,6 +1222,13 @@ _fm_composer_row_is_pi_status() {  # <trimmed-row>
   fm_composer_idle_matches "$1" "$FM_COMPOSER_PI_STATUS_RE_DEFAULT" sensitive
 }
 
+# _fm_composer_row_is_agy_footer: 0 when the trimmed row is agy's verified idle
+# status row (FM_COMPOSER_AGY_FOOTER_RE_DEFAULT above) - the composer furniture
+# that proves the bare `>` above the rule pair is agy's composer.
+_fm_composer_row_is_agy_footer() {  # <trimmed-row>
+  fm_composer_idle_matches "$1" "${FM_COMPOSER_AGY_FOOTER_RE:-$FM_COMPOSER_AGY_FOOTER_RE_DEFAULT}" sensitive
+}
+
 # _fm_composer_row_is_braille_furniture: 0 when the row is non-blank and its
 # non-whitespace content is entirely braille cells (fm_composer_strip_braille
 # above) - an animation row that never counts as typed content and bounds a
@@ -1804,6 +1824,33 @@ _fm_composer_classify_bare_pi_overlap() {  # <screen> <styled> <has-identity> <i
   fi
 }
 
+# _fm_composer_agy_pair_empty_ok: 0 when <screen> holds agy's VERIFIED empty
+# composer - a bare `>` row with nothing typed, exactly filling the recorded
+# separator pair with agy's idle footer directly beneath its closing rule
+# (verified live on agy 1.2.14). Every element is required: a bare `>` without
+# the rule pair and footer stays `unknown` (dead shell), and any typed text
+# fails the exact-`>` match so it keeps its normal verdict instead of reading
+# empty. <screen> may carry ANSI styling; rows are stripped before matching.
+# The scan globals must already be recorded; every pi-route caller records
+# them before reaching the pi verdict below.
+_fm_composer_agy_pair_empty_ok() {  # <screen>
+  local screen=$1 open close row raw content plain footer
+  open=$FM_COMPOSER_SCAN_PI_OPEN
+  close=$FM_COMPOSER_SCAN_PI_CLOSE
+  [ "$open" -ge 0 ] || return 1
+  [ "$close" -eq "$((open + 2))" ] || return 1
+  row=$((open + 1))
+  raw=$(_fm_composer_screen_row "$row" "$screen")
+  content=$(_fm_composer_row_content "$raw" 1)
+  plain=$(_fm_composer_row_content "$raw" 0)
+  [ "$content" = '>' ] || return 1
+  [ "$plain" = '>' ] || return 1
+  footer=$(_fm_composer_screen_row "$((close + 1))" "$screen")
+  footer=$(printf '%s\n' "$footer" | fm_composer_strip_ansi)
+  fm_composer_normalize_trim_var footer
+  _fm_composer_row_is_agy_footer "$footer"
+}
+
 # The pi separated-shape verdict: identity + structure conjunction (herdr's
 # rule, now fleet-wide). A missing identity capability keeps the shape
 # unknown; an unfetched identity on an identity-capable backend asks the
@@ -1813,8 +1860,15 @@ _fm_composer_classify_bare_pi_overlap() {  # <screen> <styled> <has-identity> <i
 # is drawn above the separator pair, so the composer region looks free while the
 # keys would answer the prompt instead of composing (issue #2797). Structure
 # cannot disprove that, so a blocked pi defers rather than claiming empty.
+# agy's verified empty composer rides the same separator-pair structure, so its
+# positive proof is checked before the pi identity demand: the furniture proves
+# the harness by itself and no probe is needed.
 _fm_composer_pi_verdict() {  # <screen> <styled> <has_identity> <identity>
   local screen=$1 styled=$2 has_identity=$3 identity=$4 agent agent_status state
+  if _fm_composer_agy_pair_empty_ok "$screen"; then
+    printf 'empty'
+    return 0
+  fi
   if [ "$has_identity" != 1 ]; then
     printf 'unknown'
     return 0

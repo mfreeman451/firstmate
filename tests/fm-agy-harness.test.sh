@@ -541,6 +541,9 @@ if [ "${1:-}" = models ]; then
   printf 'gemini-3.8-flash-high\tGemini 3.8 Flash (High)\n'
   printf 'gemini-3.8-flash-medium\tGemini 3.8 Flash (Medium)\n'
   printf 'gemini-3.8-flash-low\tGemini 3.8 Flash (Low)\n'
+  printf 'claude-opus-4-6-thinking\tClaude Opus 4.6 (Thinking)\n'
+  printf 'claude-sonnet-4-6\tClaude Sonnet 4.6\n'
+  printf 'gpt-oss-120b-medium\tGpt Oss 120b (Medium)\n'
   exit 0
 fi
 echo "fake agy must never execute" >&2
@@ -639,6 +642,52 @@ test_agy_launch_carries_the_brief_with_model_effort_and_autonomy() {
   assert_grep 'model=gemini-3.8-flash-low' "$meta" "agy meta did not record its model"
   assert_grep 'effort=low' "$meta" "agy meta did not record its effort"
   pass "fm-spawn: agy launch carries brief, model, effort, and autonomy with cleared markers"
+}
+
+test_agy_claude_model_omits_effort_but_records_it() {
+  local id rec out rc launch meta
+  id="agy-claude-effort-z15-$$"
+  rec=$(make_agy_spawn_case claude-effort "$id")
+  read_agy_spawn_record "$rec"
+  out=$(run_agy_spawn "$CASE_DIR" "$HOME_DIR" "$PROJ_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$id" \
+    --model claude-opus-4-6-thinking --effort high)
+  rc=$?
+  expect_code 0 "$rc" "agy spawn with a claude model and effort should succeed by omitting the flag"
+  launch=$(cat "$CASE_DIR/launch.log")
+  assert_contains "$launch" "--model 'claude-opus-4-6-thinking'" "agy launch dropped the requested claude model"
+  assert_not_contains "$launch" "--effort" "agy launch passed --effort for a claude model, which agy 1.2.14 rejects"
+  meta="$HOME_DIR/state/$id.meta"
+  assert_grep 'effort=high' "$meta" "agy meta did not retain the omitted effort axis"
+  pass "fm-spawn: agy omits --effort for claude models but records it in task metadata"
+}
+
+test_agy_suffixed_effort_mismatch_refuses_before_pane_creation() {
+  local id rec out rc
+  id="agy-effortclash-z16-$$"
+  rec=$(make_agy_spawn_case effortclash "$id")
+  read_agy_spawn_record "$rec"
+  rc=0
+  out=$(run_agy_spawn "$CASE_DIR" "$HOME_DIR" "$PROJ_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$id" \
+    --model gemini-3.8-flash-low --effort high) || rc=$?
+  [ "$rc" -ne 0 ] || fail "an effort conflicting with the suffixed agy model should refuse the spawn"
+  assert_contains "$out" "conflicts with --effort" "effort-mismatch refusal lacked its concrete reason"
+  [ -s "$CASE_DIR/launch.log" ] && fail "a mismatched effort created a launch command" || true
+  pass "fm-spawn: an effort conflicting with the suffixed agy model refuses before pane creation"
+}
+
+test_agy_suffixed_effort_match_carries_the_flag() {
+  local id rec out rc launch
+  id="agy-effortmatch-z17-$$"
+  rec=$(make_agy_spawn_case effortmatch "$id")
+  read_agy_spawn_record "$rec"
+  out=$(run_agy_spawn "$CASE_DIR" "$HOME_DIR" "$PROJ_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$id" \
+    --model gpt-oss-120b-medium --effort medium)
+  rc=$?
+  expect_code 0 "$rc" "agy spawn with a matching suffixed effort should succeed"
+  launch=$(cat "$CASE_DIR/launch.log")
+  assert_contains "$launch" "--model 'gpt-oss-120b-medium'" "agy launch dropped the requested model"
+  assert_contains "$launch" "--effort 'medium'" "agy launch dropped the matching effort"
+  pass "fm-spawn: agy carries --effort when it matches the suffixed model"
 }
 
 test_agy_effort_xhigh_is_recorded_but_omitted() {
@@ -901,6 +950,9 @@ test_herdr_shell_first_with_live_registry_stays_live
 test_herdr_lone_unregistered_pane_is_agent_free
 test_herdr_malformed_and_failed_reads_stay_unknown
 test_agy_launch_carries_the_brief_with_model_effort_and_autonomy
+test_agy_claude_model_omits_effort_but_records_it
+test_agy_suffixed_effort_mismatch_refuses_before_pane_creation
+test_agy_suffixed_effort_match_carries_the_flag
 test_agy_effort_xhigh_is_recorded_but_omitted
 test_agy_unlisted_model_refuses_before_pane_creation
 test_agy_unreachable_listing_launches_unvalidated
